@@ -1,8 +1,3 @@
-"""
-Dynamic Factor Model (DFM) voor tijdreeksdata.
-Schat latente factoren uit verklarende variabelen en plot de resultaten.
-"""
-
 import logging
 import warnings
 from pathlib import Path
@@ -11,122 +6,190 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from statsmodels.tsa.api import DynamicFactor
+import statsmodels.api as sm
+from statsmodels.tsa.statespace.dynamic_factor import DynamicFactor
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
+GDP_COL = "GrossDomesticProduct_1"
 
-def load_and_prepare_data(file_path: Path) -> pd.DataFrame:
-    """
-    Load CSV with a 'date' column as index and keep missing values (ragged edge).
-    """
-    data = pd.read_csv(file_path, index_col="date", parse_dates=True, dayfirst=True)
-
-    # monthly start frequency
-    data = data.asfreq("MS")
-
-    # basic cleanup: ensure numeric
-    for c in data.columns:
-        data[c] = pd.to_numeric(data[c], errors="coerce")
-
-    logger.info(f"Loaded data: {data.shape[0]} rows, {data.shape[1]} columns.")
-    return data
+# Zet dit op True als je later factor->kwartaal aggregatie wil gebruiken
+USE_QUARTER_FACTOR = False
 
 
-def drop_sparse_columns(df: pd.DataFrame, min_non_missing_frac: float = 0.70) -> pd.DataFrame:
-    """
-    Drop columns with too many missing values.
-    """
-    keep = df.columns[df.notna().mean() >= min_non_missing_frac]
-    dropped = set(df.columns) - set(keep)
+# -------------------------
+# IO
+# -------------------------
+def load_dfm_ready(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").set_index("date")
+    df = df.asfreq("MS")
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    logger.info(f"Loaded DFM-ready data: {df.shape}")
+    return df
+
+
+# -------------------------
+# Cleaning helpers
+# -------------------------
+def drop_near_constant_cols(X: pd.DataFrame, eps: float = 1e-6) -> pd.DataFrame:
+    sd = X.std(skipna=True, ddof=0)
+    keep = sd[sd > eps].index
+    dropped = list(set(X.columns) - set(keep))
     if dropped:
-        logger.info(f"Dropping {len(dropped)} sparse columns (>{1-min_non_missing_frac:.0%} missing).")
-    return df[keep].copy()
+        logger.info(f"Dropping {len(dropped)} near-constant cols: {sorted(dropped)}")
+    X2 = X[keep].copy()
+    if X2.shape[1] == 0:
+        raise ValueError("After dropping near-constant cols, no columns remain.")
+    return X2
 
 
-def standardize(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
-    """
-    Z-score standardization column-wise, ignoring missings.
-    """
-    mu = df.mean(skipna=True)
-    sd = df.std(skipna=True, ddof=0).replace(0.0, np.nan)
-    z = (df - mu) / sd
-    return z, mu, sd
+def drop_sparse_cols(X: pd.DataFrame, min_non_missing_frac: float = 0.70) -> pd.DataFrame:
+    frac = X.notna().mean()
+    keep = frac[frac >= min_non_missing_frac].index
+    dropped = list(set(X.columns) - set(keep))
+    if dropped:
+        logger.info(f"Dropping {len(dropped)} sparse cols: {sorted(dropped)}")
+    X2 = X[keep].copy()
+    if X2.shape[1] == 0:
+        raise ValueError("After dropping sparse cols, no columns remain.")
+    return X2
 
 
-def fit_dynamic_factor_model(X: pd.DataFrame, k_factors: int = 1, factor_order: int = 1):
-    model = DynamicFactor(endog=X, k_factors=k_factors, factor_order=factor_order)
+# -------------------------
+# DFM fit
+# -------------------------
+def fit_dfm(endog: pd.DataFrame, k_factors=1, factor_order=1, error_order=1):
+    if endog.shape[0] < 50:
+        raise ValueError(f"Too few observations for DFM: {endog.shape[0]}")
+    if endog.shape[1] < 3:
+        raise ValueError(f"Too few series for DFM: {endog.shape[1]}")
 
-    # More robust fit settings
-    res = model.fit(method="lbfgs", maxiter=2000, disp=False)
-    logger.info(f"Converged: {res.mle_retvals.get('converged', None)} | llf={res.llf:.2f}")
+    mod = DynamicFactor(
+        endog=endog,
+        k_factors=k_factors,
+        factor_order=factor_order,
+        error_order=error_order
+    )
+    res = mod.fit(method="lbfgs", maxiter=1500, disp=False)
+    logger.info(
+        f"Converged: {res.mle_retvals.get('converged', None)} | "
+        f"llf={res.llf:.2f} | AIC={res.aic:.2f} | BIC={res.bic:.2f}"
+    )
     return res
 
 
-def plot_factors(factors_df: pd.DataFrame) -> None:
+def extract_smoothed_factors(res, index) -> pd.DataFrame:
+    f = np.asarray(res.factors.smoothed)
+    # vaak (k_factors, T) -> transpose naar (T, k_factors)
+    if f.shape[0] < f.shape[1]:
+        f = f.T
+    F = pd.DataFrame(f, index=index, columns=[f"Factor_{i+1}" for i in range(f.shape[1])])
+    return F
+
+
+def plot_factors(F: pd.DataFrame) -> None:
     plt.figure(figsize=(12, 5))
-    for col in factors_df.columns:
-        plt.plot(factors_df.index, factors_df[col], label=col)
+    for col in F.columns:
+        plt.plot(F.index, F[col], label=col)
     plt.title("Smoothed latent factors (DFM)")
-    plt.xlabel("Time")
-    plt.ylabel("Factor")
-    plt.legend()
     plt.grid(True)
+    plt.legend()
     plt.tight_layout()
     plt.show()
 
 
-def plot_loadings(res, X_columns: list[str]) -> None:
-    """
-    Plot factor loadings. Statsmodels stores loadings in res.params with naming convention.
-    """
-    # loadings parameters typically like "loading.f1.<varname>" depending on version
-    loadings = {}
-    for name, val in res.params.items():
-        if "loading" in name:
-            loadings[name] = val
+# -------------------------
+# Bridge regression: GDP on factors
+# -------------------------
+def quarterly_average_factors(F: pd.DataFrame) -> pd.DataFrame:
+    """Gemiddelde factor per kwartaal (over 3 maanden)."""
+    Fq = F.copy()
+    Fq["__q__"] = Fq.index.to_period("Q")
+    Fq = Fq.groupby("__q__").mean(numeric_only=True)
+    Fq.index = Fq.index.to_timestamp(how="end")  # kwartaal-einde timestamp
+    return Fq
 
-    if not loadings:
-        logger.warning("No loadings found in params (statsmodels naming may differ).")
-        return
 
-    s = pd.Series(loadings).sort_values()
-    plt.figure(figsize=(10, max(4, 0.25 * len(s))))
-    plt.barh(s.index, s.values)
-    plt.title("Estimated factor loadings (raw parameter names)")
-    plt.tight_layout()
-    plt.show()
+def fit_bridge_regression(gdp: pd.Series, F: pd.DataFrame):
+    """
+    OLS: GDP op factoren. We matchen op index van GDP.
+    - Als USE_QUARTER_FACTOR=False: gebruik factoren op GDP-datums (jouw huidige aanpak).
+    - Als True: gebruik kwartaalgemiddelde factoren en match op kwartaal.
+    """
+    gdp = pd.to_numeric(gdp, errors="coerce").dropna()
+
+    if gdp.shape[0] < 30:
+        raise ValueError(f"Too few GDP observations for bridge regression: {gdp.shape[0]}")
+
+    if USE_QUARTER_FACTOR:
+        F_use = quarterly_average_factors(F)
+        # match GDP naar kwartaal-einde index (zelfde timestamp convention)
+        gdp_q = gdp.copy()
+        gdp_q.index = gdp_q.index.to_period("Q").to_timestamp(how="end")
+        gdp_q = gdp_q.groupby(gdp_q.index).last()
+        df_reg = pd.concat([gdp_q.rename("gdp"), F_use], axis=1).dropna()
+        y = df_reg["gdp"]
+        Xreg = sm.add_constant(df_reg.drop(columns=["gdp"]), has_constant="add")
+    else:
+        # match factor rows op GDP-datums
+        F_q = F.loc[gdp.index]
+        df_reg = pd.concat([gdp.rename("gdp"), F_q], axis=1).dropna()
+        y = df_reg["gdp"]
+        Xreg = sm.add_constant(df_reg.drop(columns=["gdp"]), has_constant="add")
+
+    ols = sm.OLS(y, Xreg).fit()
+    return ols
 
 
 def main():
-    data_path = Path("Data prep/Data prep/top20_monthly_grid_from2005.csv")
-    data = load_and_prepare_data(data_path)
+    path = Path("data_transformations_DFM_ready_state_space.csv")
+    df = load_dfm_ready(path)
 
-    # If you *really* intend last column = y, keep it explicit:
-    # y = data["gdp"]  # <-- better: name-based
-    # X = data.drop(columns=["gdp"])
+    if GDP_COL not in df.columns:
+        raise ValueError(f"GDP_COL '{GDP_COL}' not found in dataset.")
 
-    X = data.iloc[:, :-1].copy()  # keep your assumption, but consider naming explicitly
+    # 1) DFM op indicatoren (zonder GDP) voor stabiliteit
+    X = df.drop(columns=[GDP_COL]).copy()
 
-    # Drop columns with too many missings
-    X = drop_sparse_columns(X, min_non_missing_frac=0.70)
+    # extra safety
+    X = drop_near_constant_cols(X, eps=1e-6)
+    X = drop_sparse_cols(X, min_non_missing_frac=0.70)
 
-    # Standardize
-    Xz, mu, sd = standardize(X)
+    # 2) Fit DFM
+    res = fit_dfm(X, k_factors=1, factor_order=1, error_order=1)
+    print(res.summary())
 
-    # Fit DFM (handles missing values via Kalman filter)
-    res = fit_dynamic_factor_model(Xz, k_factors=1, factor_order=1)
+    # 3) Factors
+    F = extract_smoothed_factors(res, X.index)
+    plot_factors(F)
 
-    # Factors
-    f = res.factors.smoothed
-    factors_df = pd.DataFrame(f, index=Xz.index, columns=[f"Factor_{i+1}" for i in range(f.shape[1])])
-    plot_factors(factors_df)
+    # 4) GDP bridge
+    gdp = df[GDP_COL].dropna()
+    ols = fit_bridge_regression(gdp, F)
+    print("\nBridge regression: GDP on factors")
+    print(ols.summary())
 
-    # Optional: loadings plot
-    plot_loadings(res, Xz.columns.tolist())
+    # 5) Nowcast op laatste maand (op basis van laatste factor-stand)
+    latest = sm.add_constant(F.iloc[[-1]], has_constant="add")
+    gdp_nowcast = float(ols.predict(latest).iloc[0])  # <- warning fix
+    print(f"\nGDP nowcast (based on latest month factors): {gdp_nowcast:.4f}")
+
+    # 6) Plot: observed GDP vs fitted (alleen op GDP-observaties)
+    fitted_q = ols.fittedvalues
+    plt.figure(figsize=(12, 4))
+    plt.scatter(ols.model.endog.index, ols.model.endog, s=18, label="Observed GDP (used in bridge)", alpha=0.7)
+    plt.plot(fitted_q.index, fitted_q, label="Fitted GDP (bridge)", linewidth=2)
+    plt.title("GDP (observed) vs fitted from factors (bridge regression)")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 
 
 if __name__ == "__main__":
