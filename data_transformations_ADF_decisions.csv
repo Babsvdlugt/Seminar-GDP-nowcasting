@@ -1,0 +1,21 @@
+variable,pvalue_c,stationary_c,chosen_rule
+Bankruptcies,0.6495311577483545,False,log-diff (ADF c nonstationary)
+BusinessLeadIndicator_NLD,0.0021492432087280677,True,level (ADF c stationary)
+CPI_1,0.995911019225898,False,log-diff (ADF c nonstationary)
+Construction_proxy,0.9931449423443606,False,log-diff (ADF c nonstationary)
+ConsumLeadIndicator_NLD,0.00898514701339036,True,level (ADF c stationary)
+"Crude oil, Brent",0.019356163197686998,True,level (ADF c stationary)
+Domestic_consumption_by_households_VolumeChangesShoppingdayAdjusted_3,0.0012336875200212943,True,level (already change series)
+Employment_allGenders_15 to 74 years_SeasonallyAdjusted_8_UnemplyRate,0.6729428840496852,False,"diff (rate-like, ADF c nonstationary)"
+Exports_Europe,0.0035742262720888066,True,level (ADF c stationary)
+GrossDomesticProduct_1,,,quarterly log-diff (special)
+Imports_Europe,0.012293552311668307,True,level (ADF c stationary)
+IndustProd_Europe_ImprtWeighted,0.016352743888081635,True,level (ADF c stationary)
+Industry_proxy,0.009724249935096782,True,level (ADF c stationary)
+MaandmutatieCPI_3,0.031103926124083792,True,level (already change series)
+NL_Consumer_confidence,0.014066952625039842,True,level (ADF c stationary)
+NL_Economic_sentiment_confidence,0.015039572203237522,True,level (ADF c stationary)
+NL_Industrial_confidence,0.0074846853190573765,True,level (ADF c stationary)
+^AEX,0.9820532770987117,False,log-diff (ADF c nonstationary)
+ecb_10Y_Yield,0.6869113788412298,False,"diff (rate-like, ADF c nonstationary)"
+ecb_3M_Yield,0.30919003081455443,False,"diff (rate-like, ADF c nonstationary)"
