@@ -13,6 +13,10 @@ def add_missing_indicators(X: pd.DataFrame) -> pd.DataFrame:
 
 def impute_train_mean(X_train: pd.DataFrame, X_any: pd.DataFrame):
     means = X_train.mean(axis=0, skipna=True)
+
+    # If a feature is all-NaN in training, mean stays NaN -> fill with 0 (safe because z-scored data)
+    means = means.fillna(0.0)
+
     X_train_imp = X_train.fillna(means)
     X_any_imp   = X_any.fillna(means)
     return X_train_imp, X_any_imp, means
@@ -24,16 +28,16 @@ df = (
       .sort_index()
 )
 
-# 2) Features/target (keep NaNs in y for nowcast)
+# 2) Features/target
 X_all_raw = df.drop(columns=[GDP_COL])
 X_all = add_missing_indicators(X_all_raw)
-y_all = df[GDP_COL]
+y_all = df[GDP_COL]  # GDP is NaN in non-release months by construction
 
 # 3) Training sample where GDP known
 known_idx = y_all.dropna().index
 y_known = y_all.loc[known_idx].astype(float)
 
-# 4) Walk-forward evaluation (last 8 known GDP points)
+# 4) Walk-forward evaluation
 n_test = min(8, max(1, len(y_known) // 4))
 split_point = len(y_known) - n_test
 
@@ -50,7 +54,6 @@ for t in range(split_point, len(y_known)):
     X_test  = X_all.loc[test_idx]
     y_test  = y_all.loc[test_idx].astype(float)
 
-    # imputatie zonder leakage
     X_train_imp, X_test_imp, _ = impute_train_mean(X_train, X_test)
 
     model = LSTreeBoost(
@@ -64,7 +67,7 @@ for t in range(split_point, len(y_known)):
     model.fit(X_train_imp.values, y_train.values)
     yhat = model.predict(X_test_imp.values)[0]
 
-    # benchmark: mean forecast
+    # mean benchmark
     yhat_mean = float(np.mean(y_train.values))
 
     preds.append(yhat)
@@ -89,14 +92,14 @@ rmse_m,  mae_m,  bias_m  = metrics(eval_df["y_true"].values, eval_df["mean_bench
 
 print(f"TreeBoost  RMSE: {rmse_tb:.4f} | MAE: {mae_tb:.4f} | bias: {bias_tb:.4f}")
 print(f"MeanBench  RMSE: {rmse_m:.4f}  | MAE: {mae_m:.4f}  | bias: {bias_m:.4f}")
-print("\nLast evaluation points:")
+print("\nEvaluation points:")
 print(eval_df)
 
-# 5) Fit final model on all known GDP, then nowcast last unknown GDP period
+# 5) Final fit + nowcast
 X_train_full = X_all.loc[known_idx]
 y_train_full = y_known
 
-X_train_full_imp, X_all_imp, means = impute_train_mean(X_train_full, X_all)
+X_train_full_imp, X_all_imp, _ = impute_train_mean(X_train_full, X_all)
 
 final_model = LSTreeBoost(n_estimators=300, learning_rate=0.05, random_state=42)
 final_model.fit(X_train_full_imp.values, y_train_full.values)
