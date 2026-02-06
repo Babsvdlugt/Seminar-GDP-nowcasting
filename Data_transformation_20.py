@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from statsmodels.tsa.stattools import adfuller
 import matplotlib.pyplot as plt
+from statsmodels.tsa.seasonal import STL
 
 # ---------- Laad de data ----------
 df = pd.read_csv("top20_monthly_grid_from2005.csv")
@@ -69,8 +70,8 @@ def adf_table(df_in: pd.DataFrame, alpha: float = 0.05, label: str = "") -> pd.D
         })
     return pd.DataFrame(rows).sort_values("variable")
 
-
-
+# Seasonality transformation
+seasonal_vars = ["Construction_proxy"]
 
 # ---------- Uitzonderingen per type variabele ----------
 RATE_LIKE = {
@@ -83,6 +84,21 @@ ALREADY_CHANGE = {
     "Domestic_consumption_by_households_VolumeChangesShoppingdayAdjusted_3",
     "MaandmutatieCPI_3",
 }
+
+# Seasonally adjustment
+for var in seasonal_vars:
+    if var in df.columns:
+        series = df[var].dropna()
+        if len(series) < 36:
+            print(f"[SKIP] {var}")
+            continue
+        try:
+            stl = STL(series, period=12, seasonal=13, robust=True)
+            df[var] = series - stl.fit().seasonal
+            print(f"[STL] {var} gecorrigeerd")
+        except Exception as e:
+            print(f"[ERROR] {var}: {e}")
+
 
 # ---------- ADF test + beslissing ----------
 alpha = 0.05
@@ -251,32 +267,29 @@ df_ss.reset_index().to_csv(OUT_PATH_SS, index=False)
 # plot_raw_series(df, "^AEX")
 
 
-def plot_before_after(df_raw, df_trans, var):
-    fig, axs = plt.subplots(2, 1, figsize=(12,6), sharex=True)
+# def plot_before_after(df_raw, df_trans, var):
+#     fig, axs = plt.subplots(2, 1, figsize=(12,6), sharex=True)
+#
+#     axs[0].plot(df_raw.index, df_raw[var])
+#     axs[0].set_title(f"{var} – raw, seasonally adjusted")
+#
+#     axs[1].plot(df_trans.index, df_trans[var])
+#     axs[1].set_title(f"{var} – transformed")
+#
+#     for ax in axs:
+#         ax.grid(True)
+#
+#     plt.tight_layout()
+#     plt.show()
+#
+# plot_before_after(df, df_tr, "Construction_proxy")
 
-    axs[0].plot(df_raw.index, df_raw[var])
-    axs[0].set_title(f"{var} – raw")
 
-    axs[1].plot(df_trans.index, df_trans[var])
-    axs[1].set_title(f"{var} – transformed")
-
-    for ax in axs:
-        ax.grid(True)
-
-    plt.tight_layout()
-    plt.show()
-
-plot_before_after(df, df_tr, "^AEX")
-
-gdp_tr = df["GrossDomesticProduct_1"]
-
-plt.figure(figsize=(12,4))
-plt.plot(gdp_tr.dropna().index, gdp_tr.dropna(), marker="o")
-plt.title("GDP (quarterly observations only)")
-plt.ylabel("GDP")
-plt.grid(True)
-plt.tight_layout()
-plt.show()
+# from statsmodels.graphics.tsaplots import plot_acf
+#
+# plot_acf(df["Construction_proxy"].dropna(), lags=36)
+# plt.title("ACF seasonality check")
+# plt.show()
 
 
 # def plot_seasonality_check(df, var):
@@ -286,6 +299,6 @@ plt.show()
 #     plt.grid(True)
 #     plt.show()
 #
-# plot_seasonality_check(df, "Bankruptcies")
+# plot_seasonality_check(df, "ecb_10Y_Yield")
 
 
