@@ -21,7 +21,7 @@ USE_QUARTER_FACTOR = False
 
 
 # -------------------------
-# IO
+# DATA INLADEN
 # -------------------------
 def load_dfm_ready(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -104,6 +104,72 @@ def plot_factors(F: pd.DataFrame) -> None:
     plt.show()
 
 
+
+# -------------------------
+# Factor selection: Comparing AIC and BIC
+# -------------------------
+def select_k_factors(
+    X: pd.DataFrame,
+    k_max: int = 8,
+    factor_order: int = 1,
+    error_order: int = 1,
+    criterion: str = "bic"
+) -> pd.DataFrame:
+    """
+    Fit DFM for k=1..k_max factors and return AIC/BIC results.
+    """
+    rows = []
+
+    # Loop over candidate numbers of factors
+    for k in range(1, k_max + 1):
+        try:
+            # Fit the DFM with k latent factors (state-space + Kalman + MLE)
+            res = fit_dfm(
+                endog=X,
+                k_factors=k,
+                factor_order=factor_order,
+                error_order=error_order
+            )
+
+            # Convergence flag from statsmodels optimizer
+            converged = res.mle_retvals.get("converged", False)
+            
+            # Store model comparison stats
+            rows.append({
+                "k_factors": k,
+                "aic": res.aic,
+                "bic": res.bic,
+                "llf": res.llf,
+                "converged": converged
+            })
+
+        except Exception as e:
+            # If the model fails (non-invertible, convergence problems, etc.),
+            # store NaNs so we can still inspect what failed.
+            logger.warning(f"k={k} failed: {e}")
+            rows.append({
+                "k_factors": k,
+                "aic": np.nan,
+                "bic": np.nan,
+                "llf": np.nan,
+                "converged": False
+            })
+
+    df_ic = pd.DataFrame(rows)
+
+    # OPTIONAL: log "best" k, but be careful: use only valid (non-NaN) rows
+    if criterion.lower() == "bic":
+        best_k = df_ic.loc[df_ic["bic"].idxmin(), "k_factors"]
+    elif criterion.lower() == "aic":
+        best_k = df_ic.loc[df_ic["aic"].idxmin(), "k_factors"]
+    else:
+        raise ValueError("criterion must be 'aic' or 'bic'")
+
+    logger.info(f"Selected k_factors={best_k} by {criterion.upper()}")
+
+    return df_ic
+
+
 # -------------------------
 # Bridge regression: GDP on factors
 # -------------------------
@@ -157,12 +223,31 @@ def main():
     # 1) DFM op indicatoren (zonder GDP) voor stabiliteit
     X = df.drop(columns=[GDP_COL]).copy()
 
-    # extra safety
-    X = drop_near_constant_cols(X, eps=1e-6)
+    # extra safety 
+    X = drop_near_constant_cols(X, eps=1e-6)  # data kleiner dan 1e-6 wordt weggelaten waarom dat getal?
     X = drop_sparse_cols(X, min_non_missing_frac=0.70)
 
-    # 2) Fit DFM
-    res = fit_dfm(X, k_factors=1, factor_order=1, error_order=1)
+    # 2) Select k_factors via informatiecriteria
+    ic_table = select_k_factors(
+        X,
+        k_max=8,
+        factor_order=1,
+        error_order=1,
+        criterion="bic"
+    )
+    print("\nFactor selection table:")
+    print(ic_table)
+
+    # kies beste k op basis van criterion, maar negeer niet-converged fits
+    ic_ok = ic_table[ic_table["converged"]].copy()
+    if ic_ok.empty:
+        raise RuntimeError("No converged DFM fits during factor selection. Try smaller k_max or simpler orders.")
+
+    best_k = int(ic_ok.sort_values("bic").iloc[0]["k_factors"])
+    logger.info(f"Using k_factors={best_k} for final model")
+
+    # 3) Fit final DFM with selected k
+    res = fit_dfm(X, k_factors=best_k, factor_order=1, error_order=1)
     print(res.summary())
 
     # 3) Factors
