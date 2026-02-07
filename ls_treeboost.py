@@ -50,21 +50,36 @@ def make_lagged_row(
     asof_t: pd.Timestamp,
     lags: list[int],
     feature_cols: list[str],
+    release_lags: dict[str, int] | None = None,
+    default_release_lag: int = 0,
 ) -> dict:
     """
-    Build one feature vector with ragged-edge lags:
-    [Z_a, Z_{a-1}, ..., Z_{a-L}] for all columns in feature_cols.
+    Build one feature vector with ragged-edge lags + publication delays.
+
+    For a variable with publication delay d months:
+    at asof_t you only observe months <= asof_t - d.
+    So feature col_lagL is available only if L >= d, else NaN.
     """
+    if release_lags is None:
+        release_lags = {}
+
     row = {}
     for L in lags:
         tL = asof_t - pd.DateOffset(months=L)
         vals = Z.loc[tL, feature_cols] if tL in Z.index else pd.Series(index=feature_cols, data=np.nan)
 
         for col in feature_cols:
-            row[f"{col}_lag{L}"] = float(vals[col]) if pd.notna(vals[col]) else np.nan
+            d = int(release_lags.get(col, default_release_lag))
+            if d < 0:
+                raise ValueError(f"release_lag must be >= 0, got {d} for {col}")
+
+            # if this observation would not yet be published at asof_t -> mask
+            if L < d:
+                row[f"{col}_lag{L}"] = np.nan
+            else:
+                row[f"{col}_lag{L}"] = float(vals[col]) if pd.notna(vals[col]) else np.nan
 
     return row
-
 
 def step1_build_supervised_set(
     Z: pd.DataFrame,
@@ -73,6 +88,8 @@ def step1_build_supervised_set(
     asof_rule: str,
     max_lag: int,
     feature_cols: list[str] | None = None,
+    release_lags: dict[str, int] | None = None,
+    default_release_lag: int = 0,
 ):
     """
     Step 1 (LS-TreeBoost)
@@ -85,13 +102,24 @@ def step1_build_supervised_set(
     lags = list(range(max_lag + 1))
     X_rows, y_rows, index = [], [], []
 
+    # GDP lag (quarterly): y_{t-1} for each quarterly t
+    y_q = y_monthly.loc[target_months]          # quarterly GDP observations
+    y_lag1_q = y_q.shift(1)                     # y_{t-1}
+
+
     for t in target_months:
         y_t = y_monthly.loc[t]
         if pd.isna(y_t):
             continue
 
         a_t = asof_month(t, asof_rule)
-        x_t = make_lagged_row(Z, a_t, lags, feature_cols)
+        x_t = make_lagged_row(
+            Z, a_t, lags, feature_cols,
+            release_lags=release_lags,
+            default_release_lag=default_release_lag,
+        )
+        # add AR(1) input as feature (available in real time: last observed quarter)
+        x_t["GDP_lag1"] = float(y_lag1_q.loc[t]) if pd.notna(y_lag1_q.loc[t]) else np.nan
 
         X_rows.append(x_t)
         y_rows.append(float(y_t))
@@ -121,34 +149,54 @@ class LS_treeboost:
         min_samples_leaf: int = 5,
         subsample: float = 1.0,
         random_state: int = 42,
-        min_samples_split: int = 10, 
-        max_features= "sqrt"
+        min_samples_split: int = 10,
+        max_features: str | int | float | None = "sqrt",
+        use_ar1_init: bool = True,
     ):
-        self.n_estimators = int(n_estimators)          # Max number of boosting iterations (trees)
-        self.learning_rate = float(learning_rate)      # Shrinkage: step size for each tree update
-        self.max_depth = int(max_depth)                # Tree complexity control (depth)
-        self.min_samples_leaf = int(min_samples_leaf)  # Regularization: minimum samples per leaf
-        self.subsample = float(subsample)              # Fraction of training data used per tree (stochastic boosting)
-        self.random_state = int(random_state)          # Random seed for reproducibility
-        self.min_samples_split = int(min_samples_split)
-        self.max_features = max_features
+        # -------------------------
+        # Hyperparameters
+        # -------------------------
+        self.n_estimators = int(n_estimators)              # max # boosting iterations (trees)
+        self.learning_rate = float(learning_rate)          # shrinkage
+        self.max_depth = int(max_depth)                    # tree complexity
+        self.min_samples_leaf = int(min_samples_leaf)      # regularization
+        self.subsample = float(subsample)                  # stochastic boosting fraction
+        self.random_state = int(random_state)              # RNG seed
+        self.min_samples_split = int(min_samples_split)    # tree split constraint
+        self.max_features = max_features                   # feature subsampling in each split
 
-        # fitted attributes
-        self.init_ = None                              # Initial constant prediction F0 = mean(y_train)
-        self.trees_ = []                               # List of fitted regression trees h_m(.)
-        self.feature_names_ = None                      # Optional feature names (for interpretability/debugging)
-        self.history_ = {"train_mse": [], "val_mse": []}# Store MSE over iterations (train/validation)
+        # -------------------------
+        # Options / switches
+        # -------------------------
+        self.use_ar1_init_ = bool(use_ar1_init)            # if True: start from AR(1) baseline when GDP_lag1 exists
 
-        # learned during fit
-        self.col_means_ = None                          # Column means (computed on TRAIN only) for NaN imputation
-        self.n_estimators_fitted_ = 0                   # Actual number of fitted trees (after early stopping)
+        # -------------------------
+        # Learned / fitted state
+        # -------------------------
+        self.keep_feat_idx_ = None                         # indices of columns kept after dropping all-NaN train cols
+        self.col_means_ = None                             # train-only column means for NaN imputation
 
+        # AR(1) baseline parameters (estimated on train only)
+        self.ar1_alpha_ = 0.0
+        self.ar1_phi_ = 0.0
+        self.ar1_idx_ = None                               # column index of GDP_lag1 after keep_feat_idx_ applied
+
+        # Constant baseline (fallback when AR(1) not used)
+        self.init_ = None                                  # mean(y_train)
+
+        # Boosting objects
+        self.trees_ = []                                   # list[DecisionTreeRegressor]
+        self.feature_names_ = None                          # aligned feature names after dropping columns
+
+        # Training history (for debugging/plots)
+        self.history_ = {"train_mse": [], "val_mse": []}
+
+        # Convenience: number of trees actually fitted (after early stopping)
+        self.n_estimators_fitted_ = 0
     @staticmethod
     def _mse(y_true, y_pred):
-        # Mean squared error loss (squared loss used in LS-boosting)
-        e = y_true - y_pred
+        e = np.asarray(y_true) - np.asarray(y_pred)
         return float(np.mean(e * e))
-
 
     @staticmethod
     def _impute_with_means(X, col_means):
@@ -160,18 +208,11 @@ class LS_treeboost:
         if X.ndim != 2:
             raise ValueError("X must be 2D")
 
-        # Work on a copy to avoid modifying the original array
         X_imp = X.copy()
-
-        # Identify missing entries (NaNs)
         nan_mask = np.isnan(X_imp)
-
-        # Replace NaNs column-wise using training-set column means
         if nan_mask.any():
             X_imp[nan_mask] = np.take(col_means, np.where(nan_mask)[1])
-
         return X_imp
-
 
     @staticmethod
     def _chronological_split(n, val_frac):
@@ -186,84 +227,140 @@ class LS_treeboost:
             raise ValueError("Too few training samples after split; reduce val_frac.")
         return np.arange(0, n - n_val), np.arange(n - n_val, n)
 
+
+    def _prepare_X(self, X_train_raw, X_val_raw, feature_names):
+        # 1) drop train-all-NaN columns
+        all_nan = np.all(np.isnan(X_train_raw), axis=0)
+        self.keep_feat_idx_ = np.where(~all_nan)[0]
+        X_train_raw = X_train_raw[:, self.keep_feat_idx_]
+        if X_val_raw is not None:
+            X_val_raw = X_val_raw[:, self.keep_feat_idx_]
+        if feature_names is not None:
+            feature_names = [feature_names[j] for j in self.keep_feat_idx_]
+
+        # 2) impute means (train only)
+        self.col_means_ = np.nanmean(X_train_raw, axis=0)
+        self.col_means_ = np.where(np.isnan(self.col_means_), 0.0, self.col_means_)
+        X_train = self._impute_with_means(X_train_raw, self.col_means_)
+        X_val = self._impute_with_means(X_val_raw, self.col_means_) if X_val_raw is not None else None
+        return X_train, X_val, feature_names
+
+    def _fit_baseline(self, X_train, y_train, X_val, y_val, feature_names):
+        self.init_ = float(np.mean(y_train))
+        self.ar1_idx_ = None
+        self.ar1_alpha_, self.ar1_phi_ = 0.0, 0.0
+
+        if self.use_ar1_init_ and feature_names is not None and "GDP_lag1" in feature_names:
+            self.ar1_idx_ = feature_names.index("GDP_lag1")
+            x = X_train[:, self.ar1_idx_]
+            beta = np.linalg.lstsq(np.column_stack([np.ones(len(x)), x]), y_train, rcond=None)[0]
+            self.ar1_alpha_, self.ar1_phi_ = float(beta[0]), float(beta[1])
+            pred_train = self.ar1_alpha_ + self.ar1_phi_ * x
+            pred_val = None if X_val is None else (self.ar1_alpha_ + self.ar1_phi_ * X_val[:, self.ar1_idx_])
+        else:
+            pred_train = np.full_like(y_train, self.init_, dtype=float)
+            pred_val = None if X_val is None else np.full_like(y_val, self.init_, dtype=float)
+
+        return pred_train, pred_val
+
     def fit(
         self,
         X,
         y,
-        feature_names: list[str] | None = None,
+        feature_names=None,
         val_frac: float = 0.0,
         early_stopping_rounds: int = 0,
     ):
-        # Fit LS-TreeBoost model using squared-loss gradient boosting
-        # Trees are sequentially fit to residuals of the current model
-        # --- cast ---
-        if hasattr(X, "values"):                         # If X is a pandas DataFrame
+        """
+        Fit LS-TreeBoost with squared-loss gradient boosting.
+        Workflow:
+        1) Cast + chronological train/val split
+        2) Prepare X: drop train-all-NaN columns + impute (train means)
+        3) Baseline init: AR(1) if GDP_lag1 exists (optional), else constant mean
+        4) Boosting: fit trees to residuals, optionally early-stop on val MSE
+        """
+
+        # -------------------------
+        # 1) Cast inputs
+        # -------------------------
+        if hasattr(X, "values"):  # pandas DataFrame
             if feature_names is None and hasattr(X, "columns"):
-                feature_names = list(X.columns)          # Keep column names as feature names
-            X = X.values                                 # Convert to NumPy array
-        X = np.asarray(X, dtype=float)                   # Ensure numeric array
+                feature_names = list(X.columns)
+            X = X.values
+        X = np.asarray(X, dtype=float)
 
-        if hasattr(y, "values"):                         # If y is a pandas Series
-            y = y.values                                 # Convert to NumPy
-        y = np.asarray(y, dtype=float).reshape(-1)       # Ensure 1D float array
+        if hasattr(y, "values"):  # pandas Series
+            y = y.values
+        y = np.asarray(y, dtype=float).reshape(-1)
 
-        n, p = X.shape                                   # n samples, p features
+        n, p = X.shape
         if y.shape[0] != n:
-            raise ValueError("X and y must have same number of rows")  # Basic consistency check
-
-        self.feature_names_ = feature_names if feature_names is not None else [f"x{j}" for j in range(p)]  # Names
+            raise ValueError("X and y must have same number of rows")
 
         if not (0.0 <= val_frac < 1.0):
-            raise ValueError("val_frac must be in [0, 1).")  # Validation fraction must be valid
+            raise ValueError("val_frac must be in [0, 1).")
 
-        train_idx, val_idx = self._chronological_split(n, val_frac)  # Chronological split (no shuffling)
+        # -------------------------
+        # 2) Chronological split (no shuffling)
+        # -------------------------
+        train_idx, val_idx = self._chronological_split(n, val_frac)
 
-        X_train_raw, y_train = X[train_idx], y[train_idx]            # Training data
-        X_val_raw, y_val = (X[val_idx], y[val_idx]) if val_idx.size > 0 else (None, None)  # Optional validation
+        X_train_raw, y_train = X[train_idx], y[train_idx]
+        X_val_raw, y_val = (X[val_idx], y[val_idx]) if val_idx.size > 0 else (None, None)
 
-        # --- NaN imputation learned on TRAIN only ---
-        col_means = np.nanmean(X_train_raw, axis=0)                  # Column means ignoring NaNs (TRAIN only)
-        col_means = np.where(np.isnan(col_means), 0.0, col_means)    # If column is all-NaN, fall back to 0.0
-        self.col_means_ = col_means                                  # Store for later imputations (val/test/predict)
+        # If feature_names not given, create generic
+        if feature_names is None:
+            feature_names = [f"x{j}" for j in range(p)]
 
-        X_train = self._impute_with_means(X_train_raw, self.col_means_)              # Impute train NaNs
-        X_val = self._impute_with_means(X_val_raw, self.col_means_) if X_val_raw is not None else None  # Impute val
+        # -------------------------
+        # 3) Prepare X (drop all-NaN train columns + impute)
+        # -------------------------
+        X_train, X_val, feature_names = self._prepare_X(X_train_raw, X_val_raw, feature_names)
+        self.feature_names_ = feature_names
 
-        # --- init model F0 = mean(y_train) ---
-        self.init_ = float(np.mean(y_train))                         # Optimal constant under squared loss
-        self.trees_ = []                                             # Reset list of trees
-        self.history_ = {"train_mse": [], "val_mse": []}             # Reset history
-        self.n_estimators_fitted_ = 0                                # Reset fitted tree count
+        # -------------------------
+        # 4) Reset fitted state
+        # -------------------------
+        self.trees_ = []
+        self.history_ = {"train_mse": [], "val_mse": []}
+        self.n_estimators_fitted_ = 0
 
-        pred_train = np.full_like(y_train, self.init_, dtype=float)  # Initial predictions on train: all mean(y_train)
-        pred_val = np.full_like(y_val, self.init_, dtype=float) if X_val is not None else None  # Same for val
+        # -------------------------
+        # 5) Baseline init (AR(1) if possible, else constant mean)
+        # -------------------------
+        pred_train, pred_val = self._fit_baseline(X_train, y_train, X_val, y_val, feature_names)
 
-        self.history_["train_mse"].append(self._mse(y_train, pred_train))  # Baseline train MSE before any trees
+        # Baseline loss
+        self.history_["train_mse"].append(self._mse(y_train, pred_train))
 
         if X_val is not None:
-            val_mse0 = self._mse(y_val, pred_val)                    # Baseline validation MSE
-            self.history_["val_mse"].append(val_mse0)                # Store baseline val MSE
-            best_val = val_mse0                                      # Best val score so far
-            best_iter = -1                                           # -1 corresponds to the constant model (no trees)
+            val_mse0 = self._mse(y_val, pred_val)
+            self.history_["val_mse"].append(val_mse0)
+            best_val = val_mse0
+            best_iter = -1
         else:
-            best_val = np.inf                                        # No validation: disable early stopping tracking
+            best_val = np.inf
             best_iter = -1
 
-        no_improve = 0                                               # Counter for early stopping
-        rng = np.random.default_rng(self.random_state)               # RNG for subsampling
 
-        # --- LS-Boost iterations ---
-        for m in range(self.n_estimators):                           # Add trees sequentially
-            resid = y_train - pred_train                             # Residuals r_m = y - F_{m-1}(x) (negative gradient)
+        # -------------------------
+        # 6) Boosting loop (fit trees to residuals)
+        # -------------------------
+        no_improve = 0
+        rng = np.random.default_rng(self.random_state)
 
+        for m in range(self.n_estimators):
+            resid = y_train - pred_train
+
+            # subsample rows if requested
             if self.subsample < 1.0:
-                base_k = int(np.floor(self.subsample * len(train_idx)))   # Desired subsample size
-                k = max(self.min_samples_leaf * 2, base_k)                # Ensure enough points given min_samples_leaf
-                k = min(k, len(train_idx))                                # Cannot sample more than available
-                sub_idx = rng.choice(len(train_idx), size=k, replace=False)# Random subsample indices
-                X_fit, r_fit = X_train[sub_idx], resid[sub_idx]           # Fit tree on subsample residuals
+                base_k = int(np.floor(self.subsample * len(train_idx)))
+                k = max(self.min_samples_leaf * 2, base_k)
+                k = min(k, len(train_idx))
+                sub_idx = rng.choice(len(train_idx), size=k, replace=False)
+                X_fit, r_fit = X_train[sub_idx], resid[sub_idx]
             else:
-                X_fit, r_fit = X_train, resid                             # Fit tree on full training data
+                X_fit, r_fit = X_train, resid
 
             tree = DecisionTreeRegressor(
                 max_depth=self.max_depth,
@@ -272,52 +369,71 @@ class LS_treeboost:
                 max_features=self.max_features,
                 random_state=self.random_state + m,
             )
+            tree.fit(X_fit, r_fit)
 
-            tree.fit(X_fit, r_fit)                                     # Fit tree to residuals (weak learner)
+            # --- monotone shrinkage update ---
+            update = self.learning_rate * tree.predict(X_train)
+            update = np.clip(update, -0.5, 0.5)
 
-            self.trees_.append(tree)                                   # Store fitted tree
-            self.n_estimators_fitted_ += 1                             # Increment fitted tree count
+            pred_train = pred_train + update
+            self.history_["train_mse"].append(self._mse(y_train, pred_train))
 
-            pred_train = pred_train + self.learning_rate * tree.predict(X_train)  # Update: F_m = F_{m-1} + nu*h_m
-            self.history_["train_mse"].append(self._mse(y_train, pred_train))     # Track training MSE
+            self.trees_.append(tree)
+            self.n_estimators_fitted_ += 1
 
-    
+            # update val predictions and early stopping
             if X_val is not None:
-                pred_val = pred_val + self.learning_rate * tree.predict(X_val)   # Apply same update on validation set
-                val_mse = self._mse(y_val, pred_val)                              # Compute validation MSE
-                self.history_["val_mse"].append(val_mse)                          # Track validation MSE
+                update_val = self.learning_rate * tree.predict(X_val)
+                update_val = np.clip(update_val, -0.5, 0.5)
+                pred_val = pred_val + update_val
+                val_mse = self._mse(y_val, pred_val)
+                self.history_["val_mse"].append(val_mse)
+
 
                 if early_stopping_rounds > 0:
-                    if val_mse < best_val - 1e-12:                                # Improvement threshold
-                        best_val = val_mse                                        # Update best val score
-                        best_iter = m                                             # Store best tree index
-                        no_improve = 0                                            # Reset counter
+                    tol = 1e-5
+                    if val_mse < best_val - tol:
+                        best_val = val_mse
+                        best_iter = m
+                        no_improve = 0
                     else:
-                        no_improve += 1                                           # No improvement this round
+                        no_improve += 1
                         if no_improve >= early_stopping_rounds:
+                            # keep best iteration
                             if best_iter == -1:
                                 # Best model is the constant baseline (no trees)
                                 self.trees_ = []
                                 self.n_estimators_fitted_ = 0
                             else:
-                                # Keep trees up to best iteration
                                 self.trees_ = self.trees_[: best_iter + 1]
                                 self.n_estimators_fitted_ = len(self.trees_)
                             break
 
-        return self                                                     # Allow chaining: model.fit(...)
+        return self
+
+
+    def _transform_X(self, X):
+        if hasattr(X, "values"):  # pandas DataFrame
+            X = X.values
+        X = np.asarray(X, dtype=float)
+
+        if self.keep_feat_idx_ is not None:
+            X = X[:, self.keep_feat_idx_]
+
+        return self._impute_with_means(X, self.col_means_)
 
     def predict(self, X):
         if self.init_ is None or self.col_means_ is None:
-            raise RuntimeError("Model not fitted yet.")                 # Must call fit before predict
+            raise RuntimeError("Model not fitted yet.")
+        X_imp = self._transform_X(X)
 
-        if hasattr(X, "values"):                                        # If pandas DataFrame
-            X = X.values                                                # Convert to NumPy array
-        X = np.asarray(X, dtype=float)                                  # Ensure float array
+        # baseline
+        if self.use_ar1_init_ and self.ar1_idx_ is not None:
+            pred = self.ar1_alpha_ + self.ar1_phi_ * X_imp[:, self.ar1_idx_]
+        else:
+            pred = np.full(X_imp.shape[0], self.init_, dtype=float)
 
-        X_imp = self._impute_with_means(X, self.col_means_)             # Impute NaNs using TRAIN means (no leakage)
-
-        pred = np.full(X_imp.shape[0], self.init_, dtype=float)         # Start from constant model F0
+        # boosted correction
         for tree in self.trees_:
-            pred += self.learning_rate * tree.predict(X_imp)            # Add each tree contribution (shrinked)
-        return pred                                                     # Final prediction: F0 + nu * sum h_m
+            pred += self.learning_rate * tree.predict(X_imp)
+        return pred
