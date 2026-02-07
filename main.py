@@ -1,11 +1,20 @@
 import numpy as np
 import pandas as pd
 
-from ls_treeboost import step0_load_state_space, step1_build_supervised_set, LS_treeboost
+from ls_treeboost import (
+    step0_load_state_space,
+    step1_build_supervised_set,
+    expanding_window_treeboost_nowcast,
+    LS_treeboost,
+)
+
+from DFM_Model import expanding_window_dfm_nowcast  # load_dfm_ready not needed if we use out0
 
 # =========================
 # CONFIG
 # =========================
+USE_DFM = False  # zet op False om DFM uit te schakelen
+
 STATE_SPACE_PATH = "data_transformations_DFM_ready_state_space.csv"
 GDP_COL = "GrossDomesticProduct_1"
 
@@ -22,7 +31,7 @@ MODEL_PARAMS = {
     "max_depth": 2,
     "min_samples_leaf": 10,
     "min_samples_split": 20,
-    "max_features": "sqrt", #log2
+    "max_features": "sqrt",  # "log2"
     "subsample": 0.6,
     "random_state": 42,
 }
@@ -30,7 +39,6 @@ MODEL_PARAMS = {
 # How many first observations to use before starting to forecast (must be big enough)
 MIN_TRAIN_OBS = 25
 
-# Example: fill these with your actual column names in out0["Z"].columns
 RELEASE_LAGS = {
     # financial market series often 0
     "ecb_3M_Yield": 0,
@@ -42,7 +50,8 @@ RELEASE_LAGS = {
     # "IndustrialProduction": 2,
     # "RetailSales": 2,
 }
-DEFAULT_RELEASE_LAG = 1   # choose a conservative baseline if you haven't specified a series
+DEFAULT_RELEASE_LAG = 1
+
 
 # =========================
 # METRICS
@@ -51,15 +60,17 @@ def rmse(y_true, y_pred):
     e = np.asarray(y_true) - np.asarray(y_pred)
     return float(np.sqrt(np.mean(e * e)))
 
+
 def mae(y_true, y_pred):
     e = np.asarray(y_true) - np.asarray(y_pred)
     return float(np.mean(np.abs(e)))
+
 
 def mse(y_true, y_pred):
     e = np.asarray(y_true) - np.asarray(y_pred)
     return float(np.mean(e * e))
 
-# Benchmark model
+
 def ar1_forecast(y_train: pd.Series, y_last: float) -> float:
     """
     Fit AR(1): y_t = alpha + phi y_{t-1} + eps
@@ -73,60 +84,7 @@ def ar1_forecast(y_train: pd.Series, y_last: float) -> float:
     beta = np.linalg.lstsq(X, y_now, rcond=None)[0]
 
     alpha_hat, phi_hat = beta
-    return alpha_hat + phi_hat * y_last
-
-# =========================
-# EXPANDING WINDOW
-# =========================
-def expanding_window_nowcast(X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
-    """
-    For each target date t (after MIN_TRAIN_OBS), fit model on all dates < t, predict y_t.
-    Uses inner time-ordered val split (VAL_FRAC_INNER) for early stopping within each fit.
-    """
-    dates = y.index
-    rows = []
-
-    for i in range(MIN_TRAIN_OBS, len(dates)):
-        t = dates[i]
-
-        # train: everything strictly before t
-        train_dates = dates[:i]
-        X_train = X.loc[train_dates]
-        y_train = y.loc[train_dates]
-
-        # test: the single point t
-        X_test = X.loc[[t]]
-        y_true = float(y.loc[t])
-
-        y_last = float(y_train.iloc[-1])
-        y_pred_ar1 = ar1_forecast(y_train, y_last)
-
-
-        model = LS_treeboost(**MODEL_PARAMS)
-        model.fit(
-            X_train,
-            y_train,
-            val_frac=VAL_FRAC_INNER,
-            early_stopping_rounds=EARLY_STOPPING_ROUNDS,
-        )
-
-        y_pred = float(model.predict(X_test)[0])
-
-        rows.append(
-            {
-                "date": t,
-                "y_true": y_true,
-                "y_pred": y_pred,
-                "y_pred_ar1": y_pred_ar1,
-                "error": y_true - y_pred,
-                "error_ar1": y_true - y_pred_ar1,
-                "abs_error": abs(y_true - y_pred),
-                "squared_error": (y_true - y_pred) ** 2,
-                "n_train": len(y_train),
-                "n_trees": len(model.trees_),
-            }
-        )
-    return pd.DataFrame(rows).set_index("date")
+    return float(alpha_hat + phi_hat * y_last)
 
 
 def main():
@@ -148,64 +106,83 @@ def main():
         default_release_lag=DEFAULT_RELEASE_LAG,
     )
 
-
     print(f"Dataset: n_obs={len(y)}, n_features={X.shape[1]}")
     print(f"As-of={ASOF_RULE}, max_lag={MAX_LAG}, MIN_TRAIN_OBS={MIN_TRAIN_OBS}")
 
-    # Expanding-window pseudo real-time nowcasts
-    df_fc = expanding_window_nowcast(X, y)
-
-    # Benchmarks on the SAME forecasted dates:
-    # (1) zero forecast (natural if y is standardized)
-    yhat0 = np.zeros(len(df_fc), dtype=float)
-
-    # Summary metrics
-    oos_rmse = rmse(df_fc["y_true"], df_fc["y_pred"])
-    oos_rmse_ar1 = rmse(df_fc["y_true"], df_fc["y_pred_ar1"])
-    oos_mae = mae(df_fc["y_true"], df_fc["y_pred"])
-    oos_rmse_zero = rmse(df_fc["y_true"], yhat0)
-
-    # Skill in MSE terms vs zero:
-    skill_mse_vs_zero = 1.0 - (mse(df_fc["y_true"], df_fc["y_pred"]) / mse(df_fc["y_true"], yhat0))
-    skill_vs_ar1 = 1.0 - (
-        mse(df_fc["y_true"], df_fc["y_pred"])
-        / mse(df_fc["y_true"], df_fc["y_pred_ar1"])
+    # -------------------------
+    # TreeBoost expanding-window nowcasts
+    # -------------------------
+    df_fc = expanding_window_treeboost_nowcast(
+        X,
+        y,
+        min_train_obs=MIN_TRAIN_OBS,
+        model_params=MODEL_PARAMS,
+        val_frac_inner=VAL_FRAC_INNER,
+        early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+        ar1_func=ar1_forecast,
     )
 
+    # -------------------------
+    # Optionally add DFM and create evaluation sample
+    # -------------------------
+    if USE_DFM:
+        df_raw = out0["Z"].join(out0["y_monthly"])
+        df_dfm = expanding_window_dfm_nowcast(
+            df_raw,
+            gdp_col=GDP_COL,
+            min_train_obs=40,
+        )
+        df_eval = df_fc.join(df_dfm[["y_pred_dfm"]], how="inner")
+        print(
+            f"Compare sample: n_obs={len(df_eval)} "
+            f"(TreeBoost={len(df_fc)}, DFM={len(df_dfm)})"
+        )
+    else:
+        df_eval = df_fc.copy()
 
+    # =========================
+    # SUMMARY METRICS
+    # =========================
+    y_true = df_eval["y_true"].to_numpy(dtype=float)
+
+    yhat_tree = df_eval["y_pred"].to_numpy(dtype=float)
+    yhat_ar1  = df_eval["y_pred_ar1"].to_numpy(dtype=float)
+    yhat_zero = np.zeros_like(y_true, dtype=float)
+
+    rmse_tree = rmse(y_true, yhat_tree)
+    mae_tree  = mae(y_true, yhat_tree)
+
+    rmse_zero = rmse(y_true, yhat_zero)
+    rmse_ar1  = rmse(y_true, yhat_ar1)
+
+    skill_tree_vs_zero = 1.0 - mse(y_true, yhat_tree) / mse(y_true, yhat_zero)
+    skill_tree_vs_ar1  = 1.0 - mse(y_true, yhat_tree) / mse(y_true, yhat_ar1)
+
+    if USE_DFM:
+        yhat_dfm = df_eval["y_pred_dfm"].to_numpy(dtype=float)
+
+        rmse_dfm = rmse(y_true, yhat_dfm)
+        mae_dfm  = mae(y_true, yhat_dfm)
+
+        skill_dfm_vs_zero = 1.0 - mse(y_true, yhat_dfm) / mse(y_true, yhat_zero)
+        skill_dfm_vs_ar1  = 1.0 - mse(y_true, yhat_dfm) / mse(y_true, yhat_ar1)
+
+    # Print
     print("\n=== EXPANDING-WINDOW (pseudo real-time) results ===")
-    print(f"OOS RMSE (model)      : {oos_rmse:.6f}")
-    print(f"OOS MAE  (model)      : {oos_mae:.6f}")
-    print(f"OOS RMSE (zero bench) : {oos_rmse_zero:.6f}")
-    print(f"OOS RMSE (AR(1) bench) : {oos_rmse_ar1:.6f}")
-    print(f"Skill (MSE vs zero)   : {skill_mse_vs_zero:.6f}")
-    print(f"Skill (MSE vs AR(1))   : {skill_vs_ar1:.6f}")
+    print(f"RMSE TreeBoost        : {rmse_tree:.6f} | MAE: {mae_tree:.6f}")
 
+    if USE_DFM:
+        print(f"RMSE DFM              : {rmse_dfm:.6f} | MAE: {mae_dfm:.6f}")
 
-    # Save per-quarter forecasts
-    out_csv = f"ls_treeboost_expanding_{ASOF_RULE}_lag{MAX_LAG}.csv"
-    df_fc.to_csv(out_csv)
-    print(f"\nSaved: {out_csv}")
+    print(f"RMSE zero benchmark   : {rmse_zero:.6f}")
+    print(f"RMSE AR(1) benchmark  : {rmse_ar1:.6f}")
 
-    # Optional: also save a compact summary row
-    summary = pd.DataFrame(
-        [{
-            "asof_rule": ASOF_RULE,
-            "max_lag": MAX_LAG,
-            "min_train_obs": MIN_TRAIN_OBS,
-            "val_frac_inner": VAL_FRAC_INNER,
-            "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
-            "oos_rmse": oos_rmse,
-            "oos_mae": oos_mae,
-            "oos_rmse_zero": oos_rmse_zero,
-            "skill_mse_vs_zero": float(skill_mse_vs_zero),
-            "skill_vs_ar1": float(skill_vs_ar1),
-            "avg_n_trees": float(df_fc["n_trees"].mean()),
-        }]
-    )
-    summary_out = f"ls_treeboost_expanding_summary_{ASOF_RULE}_lag{MAX_LAG}.csv"
-    summary.to_csv(summary_out, index=False)
-    print(f"Saved: {summary_out}")
+    print(f"Skill TreeBoost vs zero (MSE): {skill_tree_vs_zero:.6f}")
+    print(f"Skill TreeBoost vs AR(1) (MSE): {skill_tree_vs_ar1:.6f}")
+
+    if USE_DFM:
+        print(f"Skill DFM      vs zero (MSE): {skill_dfm_vs_zero:.6f}")
+        print(f"Skill DFM      vs AR(1) (MSE): {skill_dfm_vs_ar1:.6f}")
 
 
 if __name__ == "__main__":

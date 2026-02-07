@@ -19,7 +19,6 @@ GDP_COL = "GrossDomesticProduct_1"
 # Zet dit op True als je later factor->kwartaal aggregatie wil gebruiken
 USE_QUARTER_FACTOR = False
 
-
 # -------------------------
 # DATA INLADEN
 # -------------------------
@@ -102,8 +101,6 @@ def plot_factors(F: pd.DataFrame) -> None:
     plt.legend()
     plt.tight_layout()
     plt.show()
-
-
 
 # -------------------------
 # Factor selection: Comparing AIC and BIC
@@ -211,6 +208,63 @@ def fit_bridge_regression(gdp: pd.Series, F: pd.DataFrame):
 
     ols = sm.OLS(y, Xreg).fit()
     return ols
+
+def expanding_window_dfm_nowcast(
+    df: pd.DataFrame,
+    gdp_col: str,
+    min_train_obs: int = 40,
+):
+    """
+    Expanding-window DFM nowcasts of GDP.
+    Returns DataFrame with index=date and column y_pred_dfm.
+    """
+    rows = []
+    gdp_dates = df[gdp_col].dropna().index
+
+    for i in range(min_train_obs, len(gdp_dates)):
+        t = gdp_dates[i]
+
+        # Train strictly before t
+        df_train = df.loc[:t].iloc[:-1]
+
+        X_train = df_train.drop(columns=[gdp_col])
+        y_train = df_train[gdp_col].dropna()
+
+        # --- feature cleaning (same philosophy as TreeBoost) ---
+        X_train = drop_near_constant_cols(X_train)
+        X_train = drop_sparse_cols(X_train)
+
+        # --- fit DFM ---
+        ic_full = select_k_factors(X_train, k_max=8, criterion="bic")
+        ic_ok = ic_full[ic_full["converged"]].copy()
+
+        if ic_ok.empty:
+            # Fallback: pak simpel model om te kunnen draaien
+            # (k=1 is stabielst; je kunt ook "beste bic ondanks non-convergence" kiezen)
+            k = 1
+            logger.warning("No converged DFM fits in this window. Falling back to k_factors=1.")
+        else:
+            k = int(ic_ok.sort_values("bic").iloc[0]["k_factors"])
+
+
+        res = fit_dfm(X_train, k_factors=k)
+        F = extract_smoothed_factors(res, X_train.index)
+
+        # --- bridge regression ---
+        ols = fit_bridge_regression(y_train, F)
+
+        # --- nowcast GDP_t using last available factor ---
+        F_last = sm.add_constant(F.iloc[[-1]], has_constant="add")
+        y_hat = float(ols.predict(F_last).iloc[0])
+
+        rows.append({
+            "date": t,
+            "y_true": float(df.loc[t, gdp_col]),
+            "y_pred_dfm": y_hat
+        })
+
+    return pd.DataFrame(rows).set_index("date")
+
 
 
 def main():

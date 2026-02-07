@@ -132,6 +132,72 @@ def step1_build_supervised_set(
     mask = ~X.isna().all(axis=1)
     return X.loc[mask], y.loc[mask]
 
+# =========================
+# EXPANDING WINDOW
+# =========================
+def expanding_window_treeboost_nowcast(
+    X: pd.DataFrame,
+    y: pd.Series,
+    min_train_obs: int,
+    model_params: dict,
+    val_frac_inner: float,
+    early_stopping_rounds: int,
+    ar1_func,
+):
+    """
+    For each target date t (after min_train_obs), fit model on all dates < t, predict y_t.
+    Uses inner time-ordered val split (val_frac_inner) for early stopping within each fit.
+
+    Notes:
+    - Everything required is passed in as arguments (no hidden dependencies on main.py).
+    - ar1_func should be a callable: ar1_func(y_train: pd.Series, y_last: float) -> float
+    """
+    dates = y.index
+    rows = []
+
+    for i in range(min_train_obs, len(dates)):
+        t = dates[i]
+
+        # train: everything strictly before t
+        train_dates = dates[:i]
+        X_train = X.loc[train_dates]
+        y_train = y.loc[train_dates]
+
+        # test: the single point t
+        X_test = X.loc[[t]]
+        y_true = float(y.loc[t])
+
+        # AR(1) benchmark
+        y_last = float(y_train.iloc[-1])
+        y_pred_ar1 = float(ar1_func(y_train, y_last))
+
+        # Fit TreeBoost
+        model = LS_treeboost(**model_params)
+        model.fit(
+            X_train,
+            y_train,
+            val_frac=val_frac_inner,
+            early_stopping_rounds=early_stopping_rounds,
+        )
+
+        y_pred = float(model.predict(X_test)[0])
+
+        rows.append(
+            {
+                "date": t,
+                "y_true": y_true,
+                "y_pred": y_pred,
+                "y_pred_ar1": y_pred_ar1,
+                "error": y_true - y_pred,
+                "error_ar1": y_true - y_pred_ar1,
+                "abs_error": abs(y_true - y_pred),
+                "squared_error": (y_true - y_pred) ** 2,
+                "n_train": int(len(y_train)),
+                "n_trees": int(len(model.trees_)),
+            }
+        )
+
+    return pd.DataFrame(rows).set_index("date")
 
 class LS_treeboost:
     """
@@ -388,7 +454,6 @@ class LS_treeboost:
                 pred_val = pred_val + update_val
                 val_mse = self._mse(y_val, pred_val)
                 self.history_["val_mse"].append(val_mse)
-
 
                 if early_stopping_rounds > 0:
                     tol = 1e-5
