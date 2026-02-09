@@ -15,9 +15,8 @@ logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 GDP_COL = "GrossDomesticProduct_1"
+USE_QUARTER_FACTOR = True
 
-# Zet dit op True als je later factor->kwartaal aggregatie wil gebruiken
-USE_QUARTER_FACTOR = False
 
 # -------------------------
 # DATA INLADEN
@@ -48,7 +47,7 @@ def drop_near_constant_cols(X: pd.DataFrame, eps: float = 1e-6) -> pd.DataFrame:
     return X2
 
 
-def drop_sparse_cols(X: pd.DataFrame, min_non_missing_frac: float = 0.70) -> pd.DataFrame:
+def drop_sparse_cols(X: pd.DataFrame, min_non_missing_frac: float = 0.30) -> pd.DataFrame:
     frac = X.notna().mean()
     keep = frac[frac >= min_non_missing_frac].index
     dropped = list(set(X.columns) - set(keep))
@@ -60,10 +59,18 @@ def drop_sparse_cols(X: pd.DataFrame, min_non_missing_frac: float = 0.70) -> pd.
     return X2
 
 
+def standardize_window(X: pd.DataFrame) -> pd.DataFrame:
+    """Standardize using window-only mean/std to avoid future leakage."""
+    mu = X.mean(skipna=True)
+    sd = X.std(skipna=True, ddof=0)
+    sd = sd.replace(0.0, np.nan)
+    return (X - mu) / sd
+
+
 # -------------------------
 # DFM fit
 # -------------------------
-def fit_dfm(endog: pd.DataFrame, k_factors=1, factor_order=1, error_order=1):
+def fit_dfm(endog: pd.DataFrame, k_factors=1, factor_order=1, error_order=0):
     if endog.shape[0] < 50:
         raise ValueError(f"Too few observations for DFM: {endog.shape[0]}")
     if endog.shape[1] < 3:
@@ -83,188 +90,191 @@ def fit_dfm(endog: pd.DataFrame, k_factors=1, factor_order=1, error_order=1):
     return res
 
 
-def extract_smoothed_factors(res, index) -> pd.DataFrame:
-    f = np.asarray(res.factors.smoothed)
-    # vaak (k_factors, T) -> transpose naar (T, k_factors)
-    if f.shape[0] < f.shape[1]:
+def extract_factors(res, index, use_filtered: bool = True) -> pd.DataFrame:
+    """
+    For real-time nowcasting, filtered factors are preferred (no future info).
+    Smoothed factors are ex-post.
+    """
+    f = np.asarray(res.factors.filtered if use_filtered else res.factors.smoothed)
+
+    T = len(index)
+    if f.shape[0] == T:
+        pass
+    elif f.shape[1] == T:
         f = f.T
+    else:
+        raise ValueError(f"Unexpected factor shape {f.shape}, expected one dim == T={T}")
+
     F = pd.DataFrame(f, index=index, columns=[f"Factor_{i+1}" for i in range(f.shape[1])])
     return F
 
 
-def plot_factors(F: pd.DataFrame) -> None:
-    plt.figure(figsize=(12, 5))
-    for col in F.columns:
-        plt.plot(F.index, F[col], label=col)
-    plt.title("Smoothed latent factors (DFM)")
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
 # -------------------------
-# Factor selection: Comparing AIC and BIC
+# Factor selection
 # -------------------------
 def select_k_factors(
     X: pd.DataFrame,
     k_max: int = 8,
     factor_order: int = 1,
-    error_order: int = 1,
+    error_order: int = 0,
     criterion: str = "bic"
 ) -> pd.DataFrame:
-    """
-    Fit DFM for k=1..k_max factors and return AIC/BIC results.
-    """
     rows = []
-
-    # Loop over candidate numbers of factors
     for k in range(1, k_max + 1):
         try:
-            # Fit the DFM with k latent factors (state-space + Kalman + MLE)
-            res = fit_dfm(
-                endog=X,
-                k_factors=k,
-                factor_order=factor_order,
-                error_order=error_order
-            )
-
-            # Convergence flag from statsmodels optimizer
-            converged = res.mle_retvals.get("converged", False)
-            
-            # Store model comparison stats
-            rows.append({
-                "k_factors": k,
-                "aic": res.aic,
-                "bic": res.bic,
-                "llf": res.llf,
-                "converged": converged
-            })
-
+            res = fit_dfm(X, k_factors=k, factor_order=factor_order, error_order=error_order)
+            converged = bool(res.mle_retvals.get("converged", False))
+            rows.append({"k_factors": k, "aic": res.aic, "bic": res.bic, "llf": res.llf, "converged": converged})
         except Exception as e:
-            # If the model fails (non-invertible, convergence problems, etc.),
-            # store NaNs so we can still inspect what failed.
             logger.warning(f"k={k} failed: {e}")
-            rows.append({
-                "k_factors": k,
-                "aic": np.nan,
-                "bic": np.nan,
-                "llf": np.nan,
-                "converged": False
-            })
+            rows.append({"k_factors": k, "aic": np.nan, "bic": np.nan, "llf": np.nan, "converged": False})
 
     df_ic = pd.DataFrame(rows)
-
-    # OPTIONAL: log "best" k, but be careful: use only valid (non-NaN) rows
-    if criterion.lower() == "bic":
-        best_k = df_ic.loc[df_ic["bic"].idxmin(), "k_factors"]
-    elif criterion.lower() == "aic":
-        best_k = df_ic.loc[df_ic["aic"].idxmin(), "k_factors"]
-    else:
+    crit = criterion.lower().strip()
+    if crit not in ["aic", "bic"]:
         raise ValueError("criterion must be 'aic' or 'bic'")
-
-    logger.info(f"Selected k_factors={best_k} by {criterion.upper()}")
-
     return df_ic
 
 
+def pick_best_k(ic_table: pd.DataFrame, criterion: str = "bic") -> int:
+    crit = criterion.lower().strip()
+    ic_ok = ic_table[ic_table["converged"]].dropna(subset=[crit])
+    if ic_ok.empty:
+        raise RuntimeError("No converged valid models for factor selection.")
+    return int(ic_ok.sort_values(crit).iloc[0]["k_factors"])
+
+
 # -------------------------
-# Bridge regression: GDP on factors
+# Bridge regression
 # -------------------------
 def quarterly_average_factors(F: pd.DataFrame) -> pd.DataFrame:
-    """Gemiddelde factor per kwartaal (over 3 maanden)."""
     Fq = F.copy()
     Fq["__q__"] = Fq.index.to_period("Q")
     Fq = Fq.groupby("__q__").mean(numeric_only=True)
-    Fq.index = Fq.index.to_timestamp(how="end")  # kwartaal-einde timestamp
+    Fq.index = Fq.index.to_timestamp(how="end")
     return Fq
 
 
 def fit_bridge_regression(gdp: pd.Series, F: pd.DataFrame):
-    """
-    OLS: GDP op factoren. We matchen op index van GDP.
-    - Als USE_QUARTER_FACTOR=False: gebruik factoren op GDP-datums (jouw huidige aanpak).
-    - Als True: gebruik kwartaalgemiddelde factoren en match op kwartaal.
-    """
     gdp = pd.to_numeric(gdp, errors="coerce").dropna()
-
-    if gdp.shape[0] < 30:
+    if gdp.shape[0] < 10:
         raise ValueError(f"Too few GDP observations for bridge regression: {gdp.shape[0]}")
 
     if USE_QUARTER_FACTOR:
         F_use = quarterly_average_factors(F)
-        # match GDP naar kwartaal-einde index (zelfde timestamp convention)
+
         gdp_q = gdp.copy()
         gdp_q.index = gdp_q.index.to_period("Q").to_timestamp(how="end")
         gdp_q = gdp_q.groupby(gdp_q.index).last()
+
         df_reg = pd.concat([gdp_q.rename("gdp"), F_use], axis=1).dropna()
         y = df_reg["gdp"]
         Xreg = sm.add_constant(df_reg.drop(columns=["gdp"]), has_constant="add")
     else:
-        # match factor rows op GDP-datums
-        F_q = F.loc[gdp.index]
-        df_reg = pd.concat([gdp.rename("gdp"), F_q], axis=1).dropna()
+        F_m = F.reindex(gdp.index)
+        df_reg = pd.concat([gdp.rename("gdp"), F_m], axis=1).dropna()
         y = df_reg["gdp"]
         Xreg = sm.add_constant(df_reg.drop(columns=["gdp"]), has_constant="add")
 
-    ols = sm.OLS(y, Xreg).fit()
-    return ols
+    return sm.OLS(y, Xreg).fit()
 
-def expanding_window_dfm_nowcast(
+
+# =========================
+# EXPANDING WINDOW PIPELINE 
+# =========================
+def expanding_window_nowcast(
     df: pd.DataFrame,
-    gdp_col: str,
-    min_train_obs: int = 40,
-):
+    k_max: int = 8,
+    factor_order: int = 1,
+    error_order: int = 0,
+    min_train_months: int = 80,
+    criterion: str = "bic",
+    use_filtered_factors: bool = True,
+) -> pd.DataFrame:
     """
-    Expanding-window DFM nowcasts of GDP.
-    Returns DataFrame with index=date and column y_pred_dfm.
+    Real-time expanding window evaluation.
+
+    For each quarter month t with GDP observed:
+      - use only data up to t
+      - standardize within window
+      - select k_t by BIC within window
+      - fit DFM within window
+      - extract FILTERED (real-time) factors
+      - fit bridge regression with GDP up to t
+      - nowcast GDP at t
     """
+
+    # --- keep columns fixed across windows (important for comparability) ---
+    X_full = df.drop(columns=[GDP_COL]).copy()
+    X_full = drop_near_constant_cols(X_full, eps=1e-6)
+    X_full = drop_sparse_cols(X_full, min_non_missing_frac=0.30)
+
+    gdp_full = pd.to_numeric(df[GDP_COL], errors="coerce")
+    target_months = gdp_full.dropna().index  # quarterly GDP months
+
     rows = []
-    gdp_dates = df[gdp_col].dropna().index
 
-    for i in range(min_train_obs, len(gdp_dates)):
-        t = gdp_dates[i]
+    for t in target_months:
+        # 1) expanding window data
+        X_win_raw = X_full.loc[:t].copy()
+        if len(X_win_raw) < min_train_months:
+            continue
 
-        # Train strictly before t
-        df_train = df.loc[:t].iloc[:-1]
+        # 2) window standardization (NO future leakage)
+        X_win = standardize_window(X_win_raw)
 
-        X_train = df_train.drop(columns=[gdp_col])
-        y_train = df_train[gdp_col].dropna()
+        # 3) select k_t by criterion (BIC) on window
+        ic_t = select_k_factors(
+            X_win, k_max=k_max, factor_order=factor_order, error_order=error_order, criterion=criterion
+        )
+        try:
+            k_t = pick_best_k(ic_t, criterion=criterion)
+        except RuntimeError:
+            continue
 
-        # --- feature cleaning (same philosophy as TreeBoost) ---
-        X_train = drop_near_constant_cols(X_train)
-        X_train = drop_sparse_cols(X_train)
+        # 4) fit final dfm on window
+        res_t = fit_dfm(X_win, k_factors=k_t, factor_order=factor_order, error_order=error_order)
 
-        # --- fit DFM ---
-        ic_full = select_k_factors(X_train, k_max=8, criterion="bic")
-        ic_ok = ic_full[ic_full["converged"]].copy()
+        # 5) extract factors (filtered recommended)
+        F_t = extract_factors(res_t, X_win.index, use_filtered=use_filtered_factors)
 
-        if ic_ok.empty:
-            # Fallback: pak simpel model om te kunnen draaien
-            # (k=1 is stabielst; je kunt ook "beste bic ondanks non-convergence" kiezen)
-            k = 1
-            logger.warning("No converged DFM fits in this window. Falling back to k_factors=1.")
+        # 6) bridge regression using GDP up to t only
+        gdp_win = gdp_full.loc[:t].dropna()
+        try:
+            ols_t = fit_bridge_regression(gdp_win, F_t)
+        except Exception:
+            continue
+
+        # 7) nowcast GDP for quarter of t
+        if USE_QUARTER_FACTOR:
+            Fq_t = quarterly_average_factors(F_t)
+            q_t = t.to_period("Q").to_timestamp(how="end")
+            if q_t not in Fq_t.index:
+                continue
+            X_now = sm.add_constant(Fq_t.loc[[q_t]], has_constant="add")
+            y_pred = float(ols_t.predict(X_now).iloc[0])
         else:
-            k = int(ic_ok.sort_values("bic").iloc[0]["k_factors"])
+            X_now = sm.add_constant(F_t.loc[[t]], has_constant="add")
+            y_pred = float(ols_t.predict(X_now).iloc[0])
 
+        y_true = float(gdp_full.loc[t])
 
-        res = fit_dfm(X_train, k_factors=k)
-        F = extract_smoothed_factors(res, X_train.index)
+        rows.append(
+            {
+                "date": t,
+                "y_true": y_true,
+                "y_pred": y_pred,
+                "error": y_true - y_pred,
+                "k_selected": k_t,
+                "bic_best": float(ic_t[ic_t["converged"]]["bic"].min())
+                if not ic_t[ic_t["converged"]].dropna(subset=["bic"]).empty
+                else np.nan,
+                "n_months_train": int(len(X_win)),
+            }
+        )
 
-        # --- bridge regression ---
-        ols = fit_bridge_regression(y_train, F)
-
-        # --- nowcast GDP_t using last available factor ---
-        F_last = sm.add_constant(F.iloc[[-1]], has_constant="add")
-        y_hat = float(ols.predict(F_last).iloc[0])
-
-        rows.append({
-            "date": t,
-            "y_true": float(df.loc[t, gdp_col]),
-            "y_pred_dfm": y_hat
-        })
-
-    return pd.DataFrame(rows).set_index("date")
-
+    out = pd.DataFrame(rows).set_index("date")
+    return out
 
 
 def main():
@@ -274,57 +284,47 @@ def main():
     if GDP_COL not in df.columns:
         raise ValueError(f"GDP_COL '{GDP_COL}' not found in dataset.")
 
-    # 1) DFM op indicatoren (zonder GDP) voor stabiliteit
-    X = df.drop(columns=[GDP_COL]).copy()
-
-    # extra safety 
-    X = drop_near_constant_cols(X, eps=1e-6)  # data kleiner dan 1e-6 wordt weggelaten waarom dat getal?
-    X = drop_sparse_cols(X, min_non_missing_frac=0.70)
-
-    # 2) Select k_factors via informatiecriteria
-    ic_table = select_k_factors(
-        X,
+    # =========================
+    # run expanding-window evaluation 
+    # =========================
+    bt = expanding_window_nowcast(
+        df,
         k_max=8,
         factor_order=1,
-        error_order=1,
-        criterion="bic"
+        error_order=0,
+        min_train_months=80,
+        criterion="bic",
+        use_filtered_factors=True,
     )
-    print("\nFactor selection table:")
-    print(ic_table)
 
-    # kies beste k op basis van criterion, maar negeer niet-converged fits
-    ic_ok = ic_table[ic_table["converged"]].copy()
-    if ic_ok.empty:
-        raise RuntimeError("No converged DFM fits during factor selection. Try smaller k_max or simpler orders.")
+    if bt.empty:
+        print("No backtest results. Try lowering min_train_months or k_max.")
+        return
 
-    best_k = int(ic_ok.sort_values("bic").iloc[0]["k_factors"])
-    logger.info(f"Using k_factors={best_k} for final model")
+    # --- summary stats  ---
+    avg_k = bt["k_selected"].mean()
+    rmse_val = float(np.sqrt(np.mean(bt["error"] ** 2)))
 
-    # 3) Fit final DFM with selected k
-    res = fit_dfm(X, k_factors=best_k, factor_order=1, error_order=1)
-    print(res.summary())
+    print("\n=== Expanding-window results ===")
+    print(f"Backtest points: {len(bt)}")
+    print(f"Average selected k (BIC): {avg_k:.2f}")
+    print(f"RMSE: {rmse_val:.4f}")
+    print("\nSelected k distribution:")
+    print(bt["k_selected"].value_counts().sort_index())
 
-    # 3) Factors
-    F = extract_smoothed_factors(res, X.index)
-    plot_factors(F)
-
-    # 4) GDP bridge
-    gdp = df[GDP_COL].dropna()
-    ols = fit_bridge_regression(gdp, F)
-    print("\nBridge regression: GDP on factors")
-    print(ols.summary())
-
-    # 5) Nowcast op laatste maand (op basis van laatste factor-stand)
-    latest = sm.add_constant(F.iloc[[-1]], has_constant="add")
-    gdp_nowcast = float(ols.predict(latest).iloc[0])  # <- warning fix
-    print(f"\nGDP nowcast (based on latest month factors): {gdp_nowcast:.4f}")
-
-    # 6) Plot: observed GDP vs fitted (alleen op GDP-observaties)
-    fitted_q = ols.fittedvalues
+    # --- plot errors ---
     plt.figure(figsize=(12, 4))
-    plt.scatter(ols.model.endog.index, ols.model.endog, s=18, label="Observed GDP (used in bridge)", alpha=0.7)
-    plt.plot(fitted_q.index, fitted_q, label="Fitted GDP (bridge)", linewidth=2)
-    plt.title("GDP (observed) vs fitted from factors (bridge regression)")
+    plt.plot(bt.index, bt["error"])
+    plt.title("Expanding-window nowcast errors (y_true - y_pred)")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    # --- plot y_true vs y_pred ---
+    plt.figure(figsize=(12, 4))
+    plt.plot(bt.index, bt["y_true"], label="Observed GDP")
+    plt.plot(bt.index, bt["y_pred"], label="Nowcast GDP")
+    plt.title("Observed vs nowcast GDP (expanding window)")
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
