@@ -371,6 +371,14 @@ class LS_treeboost:
         # -------------------------
         train_idx, val_idx = self._chronological_split(n, val_frac)
 
+        # Safety: ensure strict chronological order (prevents accidental shuffle later)
+        if train_idx.size > 1 and not np.all(train_idx[1:] > train_idx[:-1]):
+            raise ValueError("train_idx is not strictly increasing (chronological split violated).")
+        if val_idx.size > 1 and not np.all(val_idx[1:] > val_idx[:-1]):
+            raise ValueError("val_idx is not strictly increasing (chronological split violated).")
+        if val_idx.size > 0 and train_idx.size > 0 and not (train_idx.max() < val_idx.min()):
+            raise ValueError("Validation must be strictly after training (chronological split violated).")
+
         X_train_raw, y_train = X[train_idx], y[train_idx]
         X_val_raw, y_val = (X[val_idx], y[val_idx]) if val_idx.size > 0 else (None, None)
 
@@ -403,11 +411,13 @@ class LS_treeboost:
             val_mse0 = self._mse(y_val, pred_val)
             self.history_["val_mse"].append(val_mse0)
             best_val = val_mse0
-            best_iter = -1
+            best_trees_len = 0  # number of trees corresponding to best_val so far
         else:
             best_val = np.inf
-            best_iter = -1
+            best_trees_len = 0
 
+        # Clip magnitude: make it configurable if the attribute exists, else default
+        max_update_abs = float(getattr(self, "max_update_abs", 0.5))
 
         # -------------------------
         # 6) Boosting loop (fit trees to residuals)
@@ -437,9 +447,10 @@ class LS_treeboost:
             )
             tree.fit(X_fit, r_fit)
 
-            # --- monotone shrinkage update ---
+            # --- shrinkage update (clipped) ---
             update = self.learning_rate * tree.predict(X_train)
-            update = np.clip(update, -0.5, 0.5)
+            if max_update_abs > 0:
+                update = np.clip(update, -max_update_abs, max_update_abs)
 
             pred_train = pred_train + update
             self.history_["train_mse"].append(self._mse(y_train, pred_train))
@@ -450,8 +461,10 @@ class LS_treeboost:
             # update val predictions and early stopping
             if X_val is not None:
                 update_val = self.learning_rate * tree.predict(X_val)
-                update_val = np.clip(update_val, -0.5, 0.5)
+                if max_update_abs > 0:
+                    update_val = np.clip(update_val, -max_update_abs, max_update_abs)
                 pred_val = pred_val + update_val
+
                 val_mse = self._mse(y_val, pred_val)
                 self.history_["val_mse"].append(val_mse)
 
@@ -459,22 +472,18 @@ class LS_treeboost:
                     tol = 1e-5
                     if val_mse < best_val - tol:
                         best_val = val_mse
-                        best_iter = m
+                        best_trees_len = len(self.trees_)
                         no_improve = 0
                     else:
                         no_improve += 1
                         if no_improve >= early_stopping_rounds:
-                            # keep best iteration
-                            if best_iter == -1:
-                                # Best model is the constant baseline (no trees)
-                                self.trees_ = []
-                                self.n_estimators_fitted_ = 0
-                            else:
-                                self.trees_ = self.trees_[: best_iter + 1]
-                                self.n_estimators_fitted_ = len(self.trees_)
+                            # keep best iteration (may be baseline-only if best_trees_len == 0)
+                            self.trees_ = self.trees_[:best_trees_len]
+                            self.n_estimators_fitted_ = len(self.trees_)
                             break
 
         return self
+
 
 
     def _transform_X(self, X):
@@ -498,7 +507,19 @@ class LS_treeboost:
         else:
             pred = np.full(X_imp.shape[0], self.init_, dtype=float)
 
-        # boosted correction
+        # in predict(), binnen de boosted correction loop
         for tree in self.trees_:
-            pred += self.learning_rate * tree.predict(X_imp)
+            upd = self.learning_rate * tree.predict(X_imp)
+            upd = np.clip(upd, -0.5, 0.5)   # zelfde clip als in fit()
+            pred += upd
+
+        # boosted correction
+        max_update_abs = float(getattr(self, "max_update_abs", 0.5))
+        for tree in self.trees_:
+            upd = self.learning_rate * tree.predict(X_imp)
+            if max_update_abs > 0:
+                upd = np.clip(upd, -max_update_abs, max_update_abs)
+            pred += upd
+
         return pred
+    
