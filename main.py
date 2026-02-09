@@ -8,7 +8,7 @@ from ls_treeboost import (
     LS_treeboost,
 )
 
-from DFM_Model import expanding_window_dfm_nowcast  # load_dfm_ready not needed if we use out0
+#from DFM_Model import expanding_window_dfm_nowcast  # load_dfm_ready not needed if we use out0
 
 # =========================
 # CONFIG
@@ -139,6 +139,49 @@ def main():
         )
     else:
         df_eval = df_fc.copy()
+    
+
+    CRISIS_PERIODS = [
+    # ("2008-10-01", "2009-07-01"),  # GFC
+    ("2011-07-01", "2013-04-01"), # Eurozone debt crisis
+    ("2018-10-01", "2019-10-01"), # Trade war/ global slowdown
+    ("2020-01-01", "2020-07-01"),  # COVID-19 crisis
+    ]
+
+    # Select crisis sample
+    df_crisis = pd.concat(
+    [df_eval.loc[start:end] for start, end in CRISIS_PERIODS]
+    )
+
+    print(f"Crisis sample: n_obs={len(df_crisis)}")
+     
+    # treeboost vs ar1 in crisis
+    y_c = df_crisis["y_true"].to_numpy(dtype=float)
+    yhat_tree_c = df_crisis["y_pred"].to_numpy(dtype=float)
+    yhat_ar1_c  = df_crisis["y_pred_ar1"].to_numpy(dtype=float)
+
+    rmse_tree_c = rmse(y_c, yhat_tree_c)
+    rmse_ar1_c  = rmse(y_c, yhat_ar1_c)
+    rmse_zero_c = rmse(y_c, np.zeros_like(y_c))
+
+    skill_tree_c = 1.0 - mse(y_c, yhat_tree_c) / mse(y_c, yhat_ar1_c)
+    skill_tree_vs_zero_c = 1.0 - mse(y_c, yhat_tree_c) / mse(y_c, np.zeros_like(y_c))
+
+    print("\n=== CRISIS PERFORMANCE ===")
+    print(f"RMSE TreeBoost (crisis): {rmse_tree_c:.6f}")
+    print(f"RMSE AR(1)    (crisis): {rmse_ar1_c:.6f}")
+    print(f"RMSE zero (crisis): {rmse_zero_c:.6f}")
+    print(f"Skill TreeBoost vs AR(1) (crisis, MSE): {skill_tree_c:.6f}")
+    print(f"Skill TreeBoost vs zero (crisis, MSE): {skill_tree_vs_zero_c:.6f}")
+
+    # Per-quarter loss differences
+    df_crisis["loss_diff"] = (
+        (df_crisis["y_true"] - df_crisis["y_pred_ar1"])**2
+        - (df_crisis["y_true"] - df_crisis["y_pred"])**2
+    )
+
+    print("\nPer-crisis-quarter loss differences:")
+    print(df_crisis[["loss_diff"]])
 
     # =========================
     # SUMMARY METRICS
