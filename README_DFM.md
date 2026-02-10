@@ -1,227 +1,194 @@
-# Dynamic Factor Model for GDP Nowcasting
+# README — CPB-style DFM Mixture (Dutch GDP nowcasting)
 
-## Overview
+This folder contains a **CPB-style pseudo real-time nowcasting pipeline** for Dutch quarterly GDP using a **Dynamic Factor Model (DFM)** estimated on a **ragged-edge** monthly/quarterly panel. The implementation follows the core DFM-nowcasting idea used by many institutions (Kalman filter on unbalanced panels, updating as new releases arrive). ([ScienceDirect][1])
 
-This repository implements a **Dynamic Factor Model (DFM)** in state-space form to extract latent economic factors from a large panel of monthly macroeconomic indicators and to use these factors for **GDP nowcasting** via a bridge regression.
+The code is split into:
 
-The model follows a standard macroeconomic nowcasting framework:
+* `DFM_Model.py` — main script: loads data, constructs vintages, runs the mixture of DFMs, writes results. 
+* `DFM_helpers.py` — utilities for loading data, lags, building vintages, mixture aggregation, and CPB-style fallback logic. 
 
-1. Extract a small number of latent common factors from high-frequency indicators using a DFM estimated via maximum likelihood and the Kalman filter.
-2. Link quarterly GDP to the latent factors using a bridge regression.
-3. Produce a real-time GDP nowcast based on the latest available information.
-
-The implementation is modular, transparent, and designed to be academically and professionally defensible.
+(Background/context on the “nowcast the present-edge publication delays is also described in the project kickoff material.) 
 
 ---
 
-## Methodological Framework
+## 1) What the model does
 
-### Dynamic Factor Model
+For each **inform-of date”, typically month-end), the pipeline:
 
-Let \( X_t \in \mathbb{R}^N \) denote a vector of standardized monthly indicators. The model assumes:
+1. **Builds a real-time vintage**: for each series, observations are kept only if they would have been **available by that as-of date** given a per-series publication lag specification. 
+2. Determines the **nowcast target quarter**: that would **not yet be published** at that as-of date (based on GDP’s own lag).
+3. Fits a **mixture (ensemble) of 12 DFMs** and produces a **single mixture nowcast**:
 
-\[
-X_t = \Lambda f_t + e_t
-\]
+   * Factors (r \in {2,3,4,5})
+   * Factor VAR order (p \in {1,2,3})
+   * Mixture = simple average across usable model outputs
 
-\[
-f_t = A f_{t-1} + u_t
-\]
-
-where:
-- \( f_t \in \mathbb{R}^K \) are latent common factors,
-- \( \Lambda \) are factor loadings,
-- \( e_t \) are idiosyncratic components,
-- the factor dynamics follow an AR(\(p\)) process.
-
-The model is estimated in **state-space form** using maximum likelihood and the Kalman filter via  
-`statsmodels.tsa.statespace.DynamicFactor`.
+This “mixture over specs” is the robustness trick: you don’t bet on one (r, p).
 
 ---
 
-### Factor Selection
+## 2) Inputs
 
-The number of latent factors \(K\) is selected using **information criteria**:
+### A) DFM-ready data panel (CSV)
 
-- Akaike Information Criterion (AIC)
-- Bayesian Information Criterion (BIC, preferred)
+Configured in `DFM_Model.py` as `DATA_PATH`. 
 
-For \(K = 1, \dots, K_{\max}\), the model is estimated and only **converged** solutions are considered.  
-The final number of factors is chosen by minimizing the selected criterion.
+Expected format:
 
----
+* A column named `date` (parse index).
+* All other columns are numeric series (monthly, quarterly, or “timestamped” series).
+* Missing values are allowed (ragged-edge is expected). 
 
-### Bridge Regression
+The loader:
 
-Quarterly GDP is linked to the latent factors via a bridge regression:
+* sorts by date,
+* sets a monthly fault),
+* coerces values to numeric. 
 
-\[
-GDP_q = \alpha + \beta' \bar{f}_q + \varepsilon_q
-\]
+### B) Publication lags file (CSV)
 
-where:
-- \( \bar{f}_q \) is the quarterly average of monthly factors,
-- GDP is aligned to quarter-end timestamps.
+Configured iLAGS_PATH`. 
 
-This approach avoids imposing mixed-frequency structure inside the state-space model and follows common practice in applied macroeconomic nowcasting.
+Required column:
 
----
+* `series` — must match the daly.
 
-## Code Structure
+Recommended metadata columns:
 
-### 1. Data Handling
+* `freq`: `M` or `Q` (default `M`)
+* `ref_point`: `period_end` or `period_start` (default `period_end`)
+* One of: `lag_days`, `lag_weeks`, `lag_months` (priority: days → weeks → months)
 
-#### `load_dfm_ready(path)`
-- Loads a CSV file with a `date` column.
-- Enforces monthly frequency (`MS`).
-- Converts all columns to numeric.
-- Sorts and indexes data chronologically.
+Optional scheduling columns supported (pass-through):
 
-#### `make_asof_df(df, asof, release_lags)`
-- Constructs a **real-time (vintage) dataset**.
-- Applies series-specific publication lags.
-- Masks observations not yet available at the `asof` date.
-- Enables realistic nowcasting with ragged edges.
+* `release_day_in_month`, `release_week_in_month`, `release_weekday`, `release_dates`, `release_group`
 
 ---
 
-### 2. Data Cleaning
+## 3) Core methodology details
 
-#### `drop_near_constant_cols(X, eps)`
-Removes series with near-zero variance to ensure numerical stability.
+### Real-time vintages (“ragged edge”)
 
-- Near-constant series do not contribute to factor identification.
-- Default tolerance `eps = 1e-6` is appropriate after standardization.
+`make_vintage(df, as_of, use_real_lags=True, lags=...)` applies the CPB-style availability rule:
 
-#### `drop_sparse_cols(X, min_non_missing_frac)`
-Drops series with insufficient data coverage.
+> observation is available at `as_of` iff `(reference_date + release_lag) <= as_of`
 
-- Balances information retention and estimation stability.
-- A relatively permissive threshold is used to exploit the Kalman filter’s ability to handle missing data.
+This is computed per series, using `freq` + `ref_point` to map each timestamp to the appropriate reference date (month end/start, quarter end/start, or raw timestamp).
 
----
+### Target quarter selection (nowcast-only)
 
-### 3. Standardization
+`get_nowcast_target_quarter(as_of, df.index, gdp_meta=...)` selects the first GDP quarter whose availability date is **after** `as_of`. GDP is expected to be quarterly (`freq='Q'`).
 
-All indicator series are standardized prior to estimation:
+If GDP isn’t found in the lags file, `DFM_Model.py` defaults GDP to a **45-day lag** from quarter end.
 
-\[
-X_{it}^{std} = \frac{X_{it} - \mu_i}{\sigma_i}
-\]
+### DFM estimation and forecasting
 
-This prevents high-variance series from dominating factor extraction and is essential for meaningful interpretation.
+Each model is a `statsmodels` `DynamicFactor` with:
 
----
+* `k_factors = r`
+* `factor_order = p`
+* `error_cov_type="diagonal"` 
 
-### 4. Model Estimation
+Forecast extraction:
 
-#### `fit_dfm(endog, k_factors, factor_order, error_order)`
-- Estimates the DFM via maximum likelihood.
-- Uses AR(1) dynamics for the latent factors.
-- Allows either white-noise or AR idiosyncratic errors.
-- Logs convergence status and information criteria.
+* If target timestamp is mple → `get_prediction`
+* Else → `get_forecast(steps=months_diff)`
 
-Only converged models are used in downstream analysis.
+(Conceptually aligned with the standard DFM + Kalman filter treatment of unbalanced panels for nowcasting.) ([ScienceDirect][1])
 
----
+### Trimming bounds (CPB-style sanity bounds)
 
-### 5. Factor Extraction
+Bounds are computed from historical GDP (default `minmax`) and each model forecast can be clipped to ([y_{\min}, y_{\max}]) before averaging.
 
-#### `extract_smoothed_factors(res, index)`
-- Extracts **smoothed** latent factors from the Kalman smoother.
-- Smoothed factors use the full sample and are appropriate for:
-  - structural interpretation,
-  - bridge regression estimation.
+### Fallback policy (important)
 
-Note: Filtered factors would be required for strict real-time backtesting.
+Model fits can fail or not converge (common in ragged-edge ML estimation). Failure is defined as:
 
----
+* explicit error, or
+* `ok=False`, or
+* non-convergence (if `TREAT_NONCONVERGENCE_AS_FAILURE=True`). 
 
-### 6. Factor Selection
+Fallback is applied **per model** (CPB-style):
 
-#### `select_k_factors(X, k_max, factor_order, error_order, criterion)`
-- Estimates DFMs for \(K = 1, \dots, K_{\max}\).
-- Collects AIC, BIC, log-likelihood, and convergence status.
-- Identifies the preferred number of factors based on the chosen criterion.
-
-Only converged models with valid information criteria are considered.
+1. If the fit fails at `as_of`, use the **previous update’s forecast for the same talable.
+2. Else use the **previous valid forecast**. 
+3. If *all* models fail at an update moment, the mixture returns a **random-walk fallback**: last observed GDP in the vintage. file7
 
 ---
 
-### 7. Bridge Regression
+## 4) How to run
 
-#### `quarterly_average_factors(F)`
-- Aggregates monthly factors to quarterly averages.
-- Aligns factors to quarter-end timestamps.
+### Dependencies
 
-#### `fit_bridge_regression(gdp, F)`
-- Estimates an OLS regression of GDP on the latent factors.
-- Supports:
-  - quarterly factor aggregation (default and recommended),
-  - monthly factor matching (optional).
+Install (minimal):
 
----
+* `pandas`
+* `numpy`
+* `statsmodels`
 
-### 8. Nowcasting
+### Configure paths
 
-Two nowcasting modes are supported:
+In `DFM_Model.py`, update:
 
-- **Quarterly nowcast (default)**  
-  Uses quarterly-averaged factors for the current quarter.
+* `DATA_PATH` (DFM-ready panel CSV)
+* `LAGS_PATH` (release lags CSV) 
 
-- **Monthly nowcast (optional)**  
-  Uses the most recent monthly factor estimate.
+Also set:
 
-The nowcast is computed as the fitted value from the bridge regression.
+* `GDP_SERIES` (default `GrossDomesticProduct_1`)
+* `ASOF_START`, `ASOF_END` (debug window by default) Run
 
----
+```bash
+python DFM_Model.py
+```
 
-## Main Execution Flow
+Output:
 
-The `main()` function implements the full pipeline:
+* Writes `dfm_mixture_results.csv` with columns:
 
-1. Load and inspect the dataset.
-2. Separate GDP from the indicator panel.
-3. Clean and standardize indicators.
-4. Select the number of factors using BIC.
-5. Estimate the final DFM.
-6. Extract and visualize latent factors.
-7. Estimate the GDP bridge regression.
-8. Produce a GDP nowcast.
-9. Plot observed versus fitted GDP.
+  * `as_of`, `target_quarter`, `mixture_forecast`, `n_models_used`, `n_failed`, `n_trimmed`
 
 ---
 
-## Key Design Choices and Justifications
+## 5) Interpreting the logs
 
-- **State-space DFM**: naturally handles missing data and explicit factor dynamics.
-- **BIC-based factor selection**: favors parsimony and mitigates overfitting.
-- **Quarterly bridge regression**: transparent handling of mixed frequencies.
-- **Standardization prior to estimation**: essential for stable and interpretable factor extraction.
-- **Convergence-aware model selection**: avoids reliance on unstable likelihood solutions.
+A typical line looks like:
 
----
+> `mixture update as_of=2010-01-31 target=2009Q4 used=8/12 failed=4 trimmed=0 mix=...`
 
-## Dependencies
+Meaning:
 
-- Python 3.x
-- numpy
-- pandas
-- matplotlib
-- statsmodels
+* At `as_of=2010-01-31`, the pipeline targeted quarter `2009Q4`
+* 8 out of 12 models were usable after failure handling
+* 4 models failed (or were treated as failures due to non-convergence)
+* `mix` is the average of the usable (and possibly trimmed) forecasts
 
 ---
 
-## Notes and Possible Extensions
+## 6) Recommended extensions (next steps)
 
-- Real-time evaluation should use **filtered** rather than smoothed factors.
-- Factor order and idiosyncratic error order can be selected analogously to the number of factors.
-- The vintage construction (`make_asof_df`) enables full real-time nowcasting extensions.
-- Rolling or expanding-window nowcast evaluation can be added for forecast performance assessment.
+* **Longer as-of schedule**: run from your first feasible real-time start until end of sample (monthly month-end grid is already implemented).
+* **Better target bounds**: use quantile bounds instead of min/max if you see extreme outliers drive clipping. 
+* **News decomposition** (optional): if you later want to attribute forecast changes to releases, see the “news” framework in Gianno([SSRN][2])
 
 ---
 
-## Disclaimer
+## 7) Key references (academic + institutional)
 
-This code is intended for case studies.
+* CPB: *Nowcasting GDP growth* (CPB model description and motivation). ([cpb.nl][3])
+* Giannone, Reichlin & Small (2008): real-time data flow and nowcasting with DFMs. ([ScienceDirect][1])
+* Bańbura & Modugno (2014): ML/EM estimation for DFMs with arbitrary missing datadged-edge patterns. ([Wiley Online Library][4])
+* Mariano & Murasawa (2003): mixed-frequency factor approach linking quarterly GDP and monthly latent activity. ([JSTOR][5])
 
+---
+
+## 8) File map (quick)
+
+* `DFM_Model.py`
+
+  * defines mixture grid, as-of schedule, model fit settings, and writes results.
+* `DFM_helpers.py`
+
+  * vintage construction (`make_vintage`), lags parsing (`load_release_lags_csv`), target quarter logic, mixture aggregation, fallback policy.
+
+If you want, I can also generate a **repo-style folder structure** section (data/outputs/scripts), plus a short “How we construct release lags” paragraph that matches your CPB Section 6–6.2 write-up style—but this README already matches what the code currently does.
