@@ -7,13 +7,17 @@ from ls_treeboost import (
     expanding_window_treeboost_nowcast,
     LS_treeboost,
 )
-
-#from DFM_Model import expanding_window_dfm_nowcast  # load_dfm_ready not needed if we use out0
+import sys
+from DFM_Model import expanding_window_nowcast # load_dfm_ready not needed if we use out0
 
 # =========================
 # CONFIG
 # =========================
-USE_DFM = False  # zet op False om DFM uit te schakelen
+USE_DFM = False  
+
+print("DEBUG: USE_DFM is nu gezet op:", USE_DFM)
+
+
 
 STATE_SPACE_PATH = "data_transformations_DFM_ready_state_space.csv"
 GDP_COL = "GrossDomesticProduct_1"
@@ -40,9 +44,26 @@ MODEL_PARAMS = {
 MIN_TRAIN_OBS = 25
 
 RELEASE_LAGS = {
-    # financial market series often 0
+    "Construction_proxy": 2,
+    "Domestic_consumption_by_households_VolumeChangesShoppingdayAdjusted_3": 2,
+    "NL_Consumer_confidence": 0,
+    "NL_Industrial_confidence": 0,
+    "NL_Economic_sentiment_confidence": 0,
+    "BusinessLeadIndicator_NLD": 0,
+    "ConsumLeadIndicator_NLD": 0,
+    "IndustProd_Europe_ImprtWeighted": 0,
+    "Exports_Europe": 2,
+    "Imports_Europe": 2,
+    "CPI_1": 1,
+    "MaandmutatieCPI_3": 1,
     "ecb_3M_Yield": 0,
     "ecb_10Y_Yield": 0,
+    "^AEX": 0,
+    "Employment_allGenders_15 to 74 years_SeasonallyAdjusted_8_UnemplyRate": 0,
+    "Bankruptcies": 1,
+    "GrossDomesticProduct_1": 3,
+
+
     # surveys often 0 (same month)
     # "PMI": 0,
     # "Confidence": 0,
@@ -126,13 +147,43 @@ def main():
     # Optionally add DFM and create evaluation sample
     # -------------------------
     if USE_DFM:
-        df_raw = out0["Z"].join(out0["y_monthly"])
-        df_dfm = expanding_window_dfm_nowcast(
+        print("Start DFM pipeline")
+
+        df_raw = out0["Z"].join(out0["y_monthly"].rename(GDP_COL))
+    
+        df_dfm = expanding_window_nowcast(   
             df_raw,
-            gdp_col=GDP_COL,
-            min_train_obs=40,
+            min_train_months=40,             
+            k_max=6,                        
+            criterion="bic",
+            use_filtered_factors=True
         )
-        df_eval = df_fc.join(df_dfm[["y_pred_dfm"]], how="inner")
+    
+        print("DFM pipeline klaar → aantal rijen:", len(df_dfm))
+        if not df_dfm.empty:
+           print(df_dfm.head(3))
+    
+        print("TreeBoost y_pred head:\n", df_fc["y_pred"].head(5))
+        print("DFM y_pred head:\n", df_dfm["y_pred"].head(5))
+
+        df_eval = df_fc.join(
+            df_dfm[["y_pred"]].rename(columns={"y_pred": "y_pred_dfm"}),
+            how="inner"
+        )
+        print("\n=== DEBUG JOIN RESULTAAT ===")
+        print("Aantal rijen df_eval:", len(df_eval))
+        print("Kolommen in df_eval:", df_eval.columns.tolist())
+
+        print("\nVergelijk y_pred TreeBoost vs DFM op eerste 5 rijen:")
+        print(df_eval[["y_pred", "y_pred_dfm"]].head(5))  # als je hernoemd hebt
+
+        print("\nIs y_pred hetzelfde als y_pred_dfm?")
+        print((df_eval["y_pred"] == df_eval["y_pred_dfm"]).all())
+
+        print("\nCorrelatie tussen TreeBoost en DFM voorspellingen:")
+        print(df_eval["y_pred"].corr(df_eval["y_pred_dfm"]))
+        print("df_raw shape:", df_raw.shape)
+        print(f"Vergelijking: {len(df_eval)} rijen")
         print(
             f"Compare sample: n_obs={len(df_eval)} "
             f"(TreeBoost={len(df_fc)}, DFM={len(df_dfm)})"
