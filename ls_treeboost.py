@@ -485,7 +485,6 @@ class LS_treeboost:
         return self
 
 
-
     def _transform_X(self, X):
         if hasattr(X, "values"):  # pandas DataFrame
             X = X.values
@@ -499,6 +498,7 @@ class LS_treeboost:
     def predict(self, X):
         if self.init_ is None or self.col_means_ is None:
             raise RuntimeError("Model not fitted yet.")
+
         X_imp = self._transform_X(X)
 
         # baseline
@@ -507,19 +507,15 @@ class LS_treeboost:
         else:
             pred = np.full(X_imp.shape[0], self.init_, dtype=float)
 
-        # in predict(), binnen de boosted correction loop
+        # boosted corrections
         for tree in self.trees_:
             upd = self.learning_rate * tree.predict(X_imp)
-            upd = np.clip(upd, -0.5, 0.5)   # zelfde clip als in fit()
-            pred += upd
-
-        # boosted correction
-        max_update_abs = float(getattr(self, "max_update_abs", 0.5))
-        for tree in self.trees_:
-            upd = self.learning_rate * tree.predict(X_imp)
-            if max_update_abs > 0:
-                upd = np.clip(upd, -max_update_abs, max_update_abs)
+            upd = np.clip(upd, -0.5, 0.5)  # zelfde clip als in fit()
             pred += upd
 
         return pred
+
+
+
+
     
