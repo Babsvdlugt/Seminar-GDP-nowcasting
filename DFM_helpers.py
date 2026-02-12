@@ -61,10 +61,10 @@ def load_release_lags_csv(path: Union[str, Path]) -> ReleaseLagMeta:
 
     REQUIRED
     --------
-    - 'series' : name of the data series (must exactly match df.columns)
+    - 'series' : name of the data series (must exactly match df.columns after cleaning)
 
-    OPTIONAL (recommended for CPB-style quasi real-time)
-    ----------------------------------------------------
+    OPTIONAL (recommended)
+    ----------------------
     - 'freq'      : 'M' or 'Q' (defaults to 'M')
     - 'ref_point' : 'period_end' or 'period_start' (defaults to 'period_end')
 
@@ -76,16 +76,6 @@ def load_release_lags_csv(path: Union[str, Path]) -> ReleaseLagMeta:
 
     Priority rule for lag columns:
         lag_days -> lag_weeks -> lag_months
-
-    OUTPUT
-    ------
-    meta : dict[str, dict]
-        meta[series] = {
-            'freq': 'M'|'Q'|'timestamp',
-            'ref_point': 'period_end'|'period_start'|'timestamp',
-            'lag_unit': 'days'|'weeks'|'months',
-            'lag_value': int
-        }
     """
     path = Path(path)
     lags_df = pd.read_csv(path)
@@ -106,14 +96,20 @@ def load_release_lags_csv(path: Union[str, Path]) -> ReleaseLagMeta:
 
     out: ReleaseLagMeta = {}
 
+    def _clean_series_name(x: Any) -> str:
+        s = str(x).strip()
+        # strip surrounding quotes that accidentally ended up in the CSV cell
+        if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
+            s = s[1:-1].strip()
+        return s
+
     for _, row in lags_df.iterrows():
-        series = str(row["series"]).strip()
+        series = _clean_series_name(row["series"])
         if series == "" or series.lower() == "nan":
             continue
 
         freq = str(row["freq"]).strip().upper()
         if freq not in {"M", "Q", "TIMESTAMP"}:
-            # allow empty/NA to default to monthly
             freq = "M"
         if freq == "TIMESTAMP":
             freq = "timestamp"
@@ -146,17 +142,23 @@ def load_release_lags_csv(path: Union[str, Path]) -> ReleaseLagMeta:
             "lag_unit": lag_unit,
             "lag_value": lag_value,
         }
-        
+
         # pass-through schedule fields if present in the CSV
-        for extra in ["release_day_in_month", "release_week_in_month", "release_weekday", "release_dates", "release_group"]:
+        for extra in [
+            "release_day_in_month",
+            "release_week_in_month",
+            "release_weekday",
+            "release_dates",
+            "release_group",
+        ]:
             if extra in lags_df.columns and pd.notna(row.get(extra, pd.NA)):
                 v_extra = row.get(extra)
                 if extra in {"release_day_in_month", "release_week_in_month", "release_weekday"}:
                     v_extra = int(v_extra)
                 out[series][extra] = v_extra
 
-
     return out
+
 
 
 # -------------------------------------------------------------------
@@ -527,33 +529,111 @@ def group_releases_by_day(
     events.sort(key=lambda e: e.as_of)
     return events
 
-
 def build_representative_update_schedule(
     meta: ReleaseLagMeta,
     start: Union[str, pd.Timestamp],
     end: Union[str, pd.Timestamp],
     *,
+    df_index: Optional[pd.DatetimeIndex] = None,
     include_empty_events: bool = False,
     bundle_same_day: bool = True,
     sort_series: bool = True,
     verbose: bool = False,
 ) -> List[UpdateEvent]:
+    """
+    Build an update (as-of) schedule.
+
+    CPB-style (recommended):
+    -----------------------
+    If df_index is provided, we derive "update days" from *availability dates* implied by:
+        availability_date(t, i) = reference_date(t, i) + lag_i
+    An update event occurs on any day where at least one new observation becomes available.
+
+    Backward-compatible fallback:
+    -----------------------------
+    If df_index is NOT provided, we use the existing calendar heuristics:
+        - explicit 'release_dates'
+        - fixed 'release_day_in_month'
+        - nth weekday rules
+
+    Parameters
+    ----------
+    meta : ReleaseLagMeta
+        Per-series lag metadata.
+    start, end : str or Timestamp
+        Date range for as-of events.
+    df_index : DatetimeIndex, optional
+        Index of the master panel (e.g., df.index). If provided, we build update events
+        from computed availability dates for all series across df_index.
+    include_empty_events : bool
+        If True, include days without releases (rarely needed; usually False).
+    bundle_same_day : bool
+        If True, bundle all series released on same day into one UpdateEvent.
+    sort_series : bool
+        Sort series in each event for determinism.
+    verbose : bool
+        Log schedule stats.
+
+    Returns
+    -------
+    List[UpdateEvent]
+        Sorted update events with as_of dates (normalized to day).
+    """
     start_ts = pd.to_datetime(start).normalize()
     end_ts = pd.to_datetime(end).normalize()
     if end_ts < start_ts:
         return []
 
     releases_by_day: Dict[pd.Timestamp, List[str]] = {}
-    for series, meta_i in meta.items():
-        dates = get_series_release_dates(series, meta_i, start_ts, end_ts)
-        for d in dates:
-            d = pd.to_datetime(d).normalize()
-            releases_by_day.setdefault(d, []).append(series)
 
+    # ---- Preferred CPB-style: derive update days from availability dates ----
+    if df_index is not None:
+        if not isinstance(df_index, pd.DatetimeIndex):
+            raise ValueError("df_index must be a pandas DatetimeIndex.")
+        idx = pd.DatetimeIndex(df_index)
+
+        # Ensure we only consider observations within a sensible window
+        # (still allow availability to fall inside [start_ts, end_ts])
+        for series, meta_i in meta.items():
+            # Skip series with incomplete lag meta
+            freq = str(meta_i.get("freq", "M"))
+            ref_point = str(meta_i.get("ref_point", "period_end"))
+            unit = str(meta_i.get("lag_unit", "months"))
+            if "lag_value" not in meta_i or meta_i.get("lag_value") is None:
+                continue
+            value = int(meta_i.get("lag_value", 0))
+
+            # Compute availability dates for ALL timestamps in idx for this series
+            ref_dates = _reference_dates_for_index(idx, freq=freq, ref_point=ref_point)
+            avail_dates = _add_lag_to_dates(ref_dates, unit=unit, value=value)
+
+            # Keep only availability dates in [start_ts, end_ts]
+            # Normalize to day to form "update events"
+            avail_days = pd.DatetimeIndex(avail_dates).normalize()
+            mask = (avail_days >= start_ts) & (avail_days <= end_ts)
+            if not mask.any():
+                continue
+
+            for d in avail_days[mask]:
+                releases_by_day.setdefault(pd.Timestamp(d), []).append(series)
+
+    # ---- Fallback: calendar heuristics (explicit dates / day-in-month / nth-weekday) ----
+    else:
+        for series, meta_i in meta.items():
+            dates = get_series_release_dates(series, meta_i, start_ts, end_ts)
+            for d in dates:
+                d = pd.to_datetime(d).normalize()
+                releases_by_day.setdefault(d, []).append(series)
+
+    # Bundle / format
     events = (
         group_releases_by_day(releases_by_day, sort_series=sort_series)
         if bundle_same_day
-        else [UpdateEvent(as_of=d, released_series=(s,)) for d, ss in releases_by_day.items() for s in (sorted(ss) if sort_series else ss)]
+        else [
+            UpdateEvent(as_of=pd.to_datetime(d).normalize(), released_series=(s,))
+            for d, ss in releases_by_day.items()
+            for s in (sorted(ss) if sort_series else ss)
+        ]
     )
     events.sort(key=lambda e: e.as_of)
 
@@ -567,18 +647,41 @@ def build_representative_update_schedule(
         events.sort(key=lambda e: e.as_of)
 
     if verbose:
-        logger.info(f"build_representative_update_schedule: start={start_ts} end={end_ts} events={len(events)}")
+        n_rel = sum(len(e.released_series) for e in events)
+        logger.info(
+            f"build_representative_update_schedule: start={start_ts.date()} end={end_ts.date()} "
+            f"events={len(events)} total_releases={n_rel} mode={'availability' if df_index is not None else 'calendar'}"
+        )
 
     return events
-
 
 # ------------------------------------------------------------
 # EXPANDING WINDOW
 # ------------------------------------------------------------
 def validate_expanding_window_monotonicity(schedule: List[Any]) -> None:
-    asofs = [pd.to_datetime(getattr(ev, "as_of", ev["as_of"])) for ev in schedule]
+    """
+    Ensure as_of dates are strictly increasing.
+    Works for:
+      - UpdateEvent objects (with attribute .as_of)
+      - dict-like objects (with key 'as_of')
+    """
+    asofs: List[pd.Timestamp] = []
+
+    for ev in schedule:
+        if hasattr(ev, "as_of"):
+            asof = getattr(ev, "as_of")
+        elif isinstance(ev, dict) and "as_of" in ev:
+            asof = ev["as_of"]
+        else:
+            raise TypeError(
+                "Schedule elements must have attribute 'as_of' or be dicts containing key 'as_of'. "
+                f"Got type={type(ev)}"
+            )
+        asofs.append(pd.to_datetime(asof))
+
     if any(asofs[i] >= asofs[i + 1] for i in range(len(asofs) - 1)):
         raise ValueError("Schedule as_of dates must be strictly increasing for expanding-window recursion.")
+
 
 
 def get_training_sample_expanding(

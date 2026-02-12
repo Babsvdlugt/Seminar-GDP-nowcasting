@@ -1,281 +1,269 @@
-
-# DFM_main.py
+# DFM_Model.py
 from __future__ import annotations
 
-import logging
-from pathlib import Path
-from typing import Any, Dict, Tuple
+import warnings
+from typing import Optional, Literal, Dict, Any, List, Tuple
+import time
 
 import numpy as np
 import pandas as pd
 from statsmodels.tsa.statespace.dynamic_factor import DynamicFactor
 
-from DFM_helpers import (
-    DFMSpec,
-    ForecastRecord,
-    TargetBounds,
-    apply_cpb_fallback_policy,
-    build_cpb_mixture_grid,
-    compute_target_bounds,
-    get_nowcast_target_quarter,
-    get_training_sample_expanding,
-    load_dfm_ready,
-    load_release_lags_csv,
-    make_vintage,
-    run_dfm_mixture_for_update,
-    update_forecast_history,
-)
 
-logger = logging.getLogger("DFM_MAIN")
-
-# -----------------------------
-# Config 
-# -----------------------------
-DATA_PATH = Path("/Users/babsvanderlugt/Downloads/seminar vs code/Seminar-GDP-nowcasting-12/data_transformations_DFM_ready_state_space.csv")
-LAGS_PATH = Path("/Users/babsvanderlugt/Downloads/seminar vs code/Seminar-GDP-nowcasting-12/release_lags_clean.csv")
-
-# -----------------------------
-# Settings
-# -----------------------------
-GDP_SERIES = "GrossDomesticProduct_1"
-
-# CPB mixture grid: r=2..5, p=1..3
-R_VALUES = (2, 3, 4, 5)
-P_VALUES = (1, 2, 3)
-
-# Fit settings
-FIT_MAXITER = 200
-FIT_METHOD = "powell"
-# "powell" = more robust but slower (derivative-free optimizer),
-# "lbfgs"  = much faster gradient-based optimizer, but may fail to converge more often
-#            when the data contain many missing values (ragged-edge vintages)
-FIT_DISP = False
-
-# As-of grid: month-end schedule (simple and stable choice)
-ASOF_START = "2010-01-31"   # first real-time "observation moment" (data available at that date)
-ASOF_END   = "2010-05-31"   # last as-of in this run (short window for faster testing/debugging)
-# This range determines for which update moments we construct vintages and produce nowcasts.
-# In the final analysis, this typically runs until the end of the sample (e.g. 2019/2020).
-
-# Generate month-end "as-of" dates (information sets) used to build real-time vintages and nowcasts.
-def month_end_grid(df_index: pd.DatetimeIndex, start=None, end=None) -> list[pd.Timestamp]:
-    # "ME" means Month-End frequency in pandas.
-    
-    idx_min = df_index.min()
-    idx_max = df_index.max()
-
-    if start is None:
-        start = idx_min.to_period("M").to_timestamp(how="end")
-    else:
-        start = pd.to_datetime(start)
-
-    if end is None:
-        end = idx_max.to_period("M").to_timestamp(how="end")
-    else:
-        end = pd.to_datetime(end)
-
-    grid = pd.date_range(start=start, end=end, freq="ME")  # month-end
-    return [pd.Timestamp(x) for x in grid]
-
-# Compute the number of whole months between two timestamps (used to determine forecast horizon length).
-def _months_diff(a: pd.Timestamp, b: pd.Timestamp) -> int:
-    return (b.year - a.year) * 12 + (b.month - a.month)
+Criterion = Literal["bic", "aic"]
 
 
-def fit_and_forecast_single_statsmodels(
+def _ensure_monthly_ms_index(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure DatetimeIndex and enforce monthly-start frequency ("MS") to avoid
+    statsmodels 'no frequency information' warnings.
+    """
+    out = df.copy()
+    if not isinstance(out.index, pd.DatetimeIndex):
+        out.index = pd.to_datetime(out.index)
+    out = out.sort_index()
+
+    # Enforce MS freq (monthly start). If your data are month-end, change to "ME".
+    try:
+        out = out.asfreq("MS")
+    except Exception:
+        # If asfreq fails, still keep sorted DatetimeIndex
+        pass
+    return out
+
+
+def _drop_bad_columns(train: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop columns that cause PCA / factor init issues:
+    - all-NA columns
+    - (almost) constant columns (std==0 ignoring NA)
+    """
+    x = train.dropna(axis=1, how="all")
+
+    if x.shape[1] == 0:
+        return x
+
+    # drop zero-variance columns (ignoring NA)
+    std = x.std(axis=0, skipna=True)
+    keep = std > 0
+    x = x.loc[:, keep]
+    return x
+
+
+def _effective_TN(train: pd.DataFrame) -> Tuple[int, int]:
+    """
+    Effective sample size for initialization constraints:
+    - T_eff: number of rows that contain at least one non-NA
+    - N_eff: number of columns (after dropping all-NA / zero-var already)
+    """
+    if train.empty:
+        return 0, 0
+    T_eff = int((~train.isna().all(axis=1)).sum())
+    N_eff = int(train.shape[1])
+    return T_eff, N_eff
+
+
+def expanding_window_nowcast(
+    df_raw: pd.DataFrame,
     *,
-    vintage_df: pd.DataFrame,
-    as_of: pd.Timestamp,
-    target_quarter: pd.Period,
-    gdp_series: str,
-    spec: DFMSpec,
-) -> Tuple[float, Dict[str, Any]]:
+    gdp_col: str = "GrossDomesticProduct_1",
+    gdp_series: Optional[str] = None,
+    min_train_months: int = 40,
+    k_max: int = 6,
+    factor_order: int = 1,
+    criterion: Criterion = "bic",
+    use_filtered_factors: bool = True,
+    fit_maxiter: int = 200,
+    fit_method: str = "em",
+    fit_disp: bool = False,
+    verbose: bool = False,
+    progress_every: int = 1,
+) -> pd.DataFrame:
     """
-    Fit a DynamicFactor model on vintage_df up to as_of (expanding window)
-    and forecast GDP at target_quarter (timestamp = quarter start).
+    Expanding-window nowcasting with a Dynamic Factor Model (statsmodels).
 
-    GDP in jullie dataset lijkt op kwartaal-start (Jan/Apr/Jul/Oct) te staan,
-    dus target_ts = quarter start is logisch.
+    Input
+    -----
+    df_raw : monthly dataframe with predictors + GDP column (GDP observed quarterly).
+            Index must be dates (monthly).
+    gdp_col : GDP column name in df_raw
+    min_train_months : minimum months in the training window before producing forecasts
+    k_max : maximum number of factors to try (will be capped dynamically each step)
+    factor_order : factor VAR order in DynamicFactor
+    criterion : "bic" or "aic" for selecting k_factors
+    use_filtered_factors : kept for API compatibility; forecasting uses get_prediction/get_forecast
+    fit_* : optimizer settings
+
+    Output
+    ------
+    DataFrame indexed by GDP observation dates (quarterly timestamps from df_raw[gdp_col].dropna().index)
+    with columns:
+      - y_true
+      - y_pred
+      - k_best
+      - crit_best (bic/aic value)
+      - n_months_train
     """
-    as_of = pd.to_datetime(as_of)
-    train = get_training_sample_expanding(vintage_df, as_of=as_of)
+    # Backward compatibility: allow gdp_series as alias for gdp_col
+    if gdp_series is not None:
+        if gdp_col != "GrossDomesticProduct_1" and gdp_col != gdp_series:
+            raise ValueError("Provide only one of gdp_col or gdp_series (or keep them identical).")
+        gdp_col = str(gdp_series)
 
-    if gdp_series not in train.columns:
-        raise ValueError(f"GDP series '{gdp_series}' not in dataframe columns.")
+    df = _ensure_monthly_ms_index(df_raw)
 
-    endog = train.copy()
+    if gdp_col not in df.columns:
+        raise ValueError(f"gdp_col='{gdp_col}' not found in df_raw columns.")
 
-    model = DynamicFactor(
-        endog=endog,
-        k_factors=int(spec.r),
-        factor_order=int(spec.p),
-        error_cov_type="diagonal",
-    )
+    # Target dates = the timestamps where GDP is observed (typically quarterly months)
+    target_dates = df[gdp_col].dropna().index
+    if len(target_dates) == 0:
+        raise ValueError("No non-missing GDP observations found to define target dates.")
 
-    res = model.fit(maxiter=FIT_MAXITER, method=FIT_METHOD, disp=FIT_DISP)
+    rows: List[Dict[str, Any]] = []
 
-    converged = bool(getattr(res, "mle_retvals", {}).get("converged", True))
+    # Reduce noisy warnings from PCA init when sample is tiny
+    warnings.filterwarnings("once", category=UserWarning)
+    warnings.filterwarnings("once", category=RuntimeWarning)
 
-    target_ts = target_quarter.to_timestamp(how="start")
-    last_train_ts = endog.index.max()
+    total_targets = len(target_dates)
+    t0_all = time.perf_counter()
 
-    if target_ts <= last_train_ts:
-        pred = res.get_prediction(start=target_ts, end=target_ts)
-        yhat = float(pred.predicted_mean[gdp_series].iloc[0])
-    else:
-        steps = _months_diff(last_train_ts, target_ts)
-        steps = max(1, steps)
-        fc = res.get_forecast(steps=steps)
-        yhat = float(fc.predicted_mean[gdp_series].iloc[-1])
+    for i, t in enumerate(target_dates, start=1):
+        t_iter_start = time.perf_counter()
+        # We want a real nowcast: use info up to the month BEFORE t
+        # (Otherwise you may inadvertently include contemporaneous GDP.)
+        as_of = (pd.Timestamp(t) - pd.offsets.MonthBegin(1))  # go to previous month-start
+        train = df.loc[:as_of].copy()
 
-    status = {
-        "ok": True,
-        "converged": converged,
-        "llf": float(getattr(res, "llf", np.nan)),
-        "aic": float(getattr(res, "aic", np.nan)),
-        "bic": float(getattr(res, "bic", np.nan)),
-        "spec": {"r": int(spec.r), "p": int(spec.p)},
-    }
-    return yhat, status
+        # Require minimum training length (in calendar months)
+        if train.shape[0] < int(min_train_months):
+            if verbose and progress_every and (i % progress_every == 0):
+                elapsed = time.perf_counter() - t_iter_start
+                print(
+                    f"[DFM] {i}/{total_targets} {t.date()} -> skip (train_months={train.shape[0]}), {elapsed:.2f}s"
+                )
+            continue
 
+        train = _drop_bad_columns(train)
 
-def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
+        # After dropping, we need GDP still present
+        if gdp_col not in train.columns:
+            # GDP might be dropped if it was all-NA in train; keep it explicitly
+            train[gdp_col] = df.loc[:as_of, gdp_col]
 
-    logger.info("Loading data + lags...")
-    if not DATA_PATH.exists():
-        raise FileNotFoundError(f"DATA_PATH not found: {DATA_PATH}")
-    if not LAGS_PATH.exists():
-        raise FileNotFoundError(f"LAGS_PATH not found: {LAGS_PATH}")
+        # If still completely unusable, skip
+        if train.shape[1] == 0:
+            if verbose and progress_every and (i % progress_every == 0):
+                elapsed = time.perf_counter() - t_iter_start
+                print(f"[DFM] {i}/{total_targets} {t.date()} -> skip (no columns), {elapsed:.2f}s")
+            continue
 
-    df = load_dfm_ready(DATA_PATH, freq="MS")
-    lags = load_release_lags_csv(LAGS_PATH)
+        T_eff, N_eff = _effective_TN(train)
+        if T_eff < 5 or N_eff < 2:
+            if verbose and progress_every and (i % progress_every == 0):
+                elapsed = time.perf_counter() - t_iter_start
+                print(
+                    f"[DFM] {i}/{total_targets} {t.date()} -> skip (T_eff={T_eff}, N_eff={N_eff}), {elapsed:.2f}s"
+                )
+            # too little info to fit a factor model sensibly
+            continue
 
-    if GDP_SERIES not in df.columns:
-        raise ValueError(f"GDP_SERIES='{GDP_SERIES}' not found in data columns.")
+        # Dynamic cap on number of factors
+        # Need k <= min(T_eff, N_eff) (safe)
+        k_cap = min(int(k_max), int(T_eff), int(N_eff))
+        if k_cap < 1:
+            if verbose and progress_every and (i % progress_every == 0):
+                elapsed = time.perf_counter() - t_iter_start
+                print(f"[DFM] {i}/{total_targets} {t.date()} -> skip (k_cap<1), {elapsed:.2f}s")
+            continue
 
-    # Bounds (CPB trimming)
-    bounds: TargetBounds = compute_target_bounds(df[GDP_SERIES], method="minmax")
-    logger.info(f"Target bounds: {bounds.y_min:.4f} .. {bounds.y_max:.4f}")
+        best_val = np.inf
+        best_res = None
+        best_k = None
+        best_status = None
 
-    # Mixture grid
-    specs = build_cpb_mixture_grid(r_values=R_VALUES, p_values=P_VALUES)
-    logger.info(f"Mixture grid: {len(specs)} DFMs")
-
-    # As-of schedule
-    asofs = month_end_grid(df.index, start=ASOF_START, end=ASOF_END)
-    logger.info(f"As-of dates: n={len(asofs)} | {asofs[0].date()} .. {asofs[-1].date()}")
-
-    # Fallback history
-    history: Dict[Tuple[str, pd.Period], list[ForecastRecord]] = {}
-
-    rows = []
-
-    # GDP meta: als niet in lags.csv, default naar Q met period_end
-    gdp_meta = lags.get(
-        GDP_SERIES,
-        {"freq": "Q", "ref_point": "period_end", "lag_unit": "days", "lag_value": 45},
-    )
-    # zorg dat freq echt Q is voor get_nowcast_target_quarter
-    gdp_meta = dict(gdp_meta)
-    gdp_meta["freq"] = "Q"
-
-    for as_of in asofs:
-        # 1) vintage
-        vintage = make_vintage(df, as_of=as_of, use_real_lags=True, lags=lags, verbose=False)
-
-        # 2) target quarter (nowcast-only)
-        target_q, _ = get_nowcast_target_quarter(as_of, df.index, gdp_meta=gdp_meta)
-
-        # 3) per-model fallback wrapper (previous update if fail)
-        def fit_single_with_fallback(**kwargs):
-            spec_local: DFMSpec = kwargs["spec"]
-            model_id = spec_local.model_id()
-
+        # Try k=1..k_cap
+        for k in range(1, k_cap + 1):
             try:
-                yhat, status = fit_and_forecast_single_statsmodels(**kwargs)
-                decision = apply_cpb_fallback_policy(
-                    status=status,
-                    model_id=model_id,
-                    target_quarter=kwargs["target_quarter"],
-                    as_of=kwargs["as_of"],
-                    history=history,
-                    current_value=yhat,
-                    prefer_previous_update=True,
+                mod = DynamicFactor(
+                    endog=train,
+                    k_factors=int(k),
+                    factor_order=int(factor_order),
+                    error_cov_type="diagonal",
                 )
-                status = dict(status)
-                status["used_fallback"] = decision.used_fallback
-                status["fallback_source"] = decision.fallback_source
-                status["note"] = decision.note
-                return float(decision.value), status
+                res = mod.fit(maxiter=int(fit_maxiter), method=str(fit_method), disp=bool(fit_disp))
 
-            except Exception as e:
-                status = {"ok": False, "converged": False, "error": str(e)}
-                decision = apply_cpb_fallback_policy(
-                    status=status,
-                    model_id=model_id,
-                    target_quarter=kwargs["target_quarter"],
-                    as_of=kwargs["as_of"],
-                    history=history,
-                    current_value=None,
-                    prefer_previous_update=True,
-                )
-                status["used_fallback"] = decision.used_fallback
-                status["fallback_source"] = decision.fallback_source
-                status["note"] = decision.note
-                return float(decision.value), status
+                aic = float(getattr(res, "aic", np.nan))
+                bic = float(getattr(res, "bic", np.nan))
+                val = bic if criterion == "bic" else aic
 
-        # 4) mixture run
-        gdp_hist = vintage[GDP_SERIES].dropna()
-        rw_fallback = float(gdp_hist.iloc[-1]) if len(gdp_hist) > 0 else 0.0
+                if np.isfinite(val) and val < best_val:
+                    best_val = val
+                    best_res = res
+                    best_k = k
+                    best_status = {"aic": aic, "bic": bic, "llf": float(getattr(res, "llf", np.nan))}
 
-        mix_out = run_dfm_mixture_for_update(
-            vintage_df=vintage,
-            as_of=as_of,
-            target_quarter=target_q,
-            gdp_series=GDP_SERIES,
-            specs=specs,
-            bounds=bounds,
-            fit_and_forecast_single=fit_single_with_fallback,
-            trim_before_mix=True,
-            drop_failed=True,              # drop failures; je fallback zit per model al
-            fallback_value=rw_fallback,    # maar als ALLES faalt: RW
-            verbose=True,
-        )
+            except Exception:
+                # silently skip failed specs
+                continue
 
+        if best_res is None or best_k is None:
+            if verbose and progress_every and (i % progress_every == 0):
+                elapsed = time.perf_counter() - t_iter_start
+                print(f"[DFM] {i}/{total_targets} {t.date()} -> skip (no fit), {elapsed:.2f}s")
+            continue
 
-        # 5) update history
-        for mid, val in mix_out.per_model_forecast.items():
-            rec = ForecastRecord(
-                as_of=as_of,
-                target_quarter=target_q,
-                value=float(val) if val is not None else np.nan,
-                model_id=mid,
-                status=mix_out.per_model_status.get(mid, {}),
-            )
-            update_forecast_history(history, rec)
+        # Forecast GDP at target date t
+        target_ts = pd.Timestamp(t)
+        last_train_ts = train.index.max()
+
+        try:
+            if target_ts <= last_train_ts:
+                pred = best_res.get_prediction(start=target_ts, end=target_ts)
+                yhat = float(pred.predicted_mean[gdp_col].iloc[0])
+            else:
+                # steps in months between last_train_ts and target_ts
+                steps = (target_ts.year - last_train_ts.year) * 12 + (target_ts.month - last_train_ts.month)
+                steps = max(1, int(steps))
+                fc = best_res.get_forecast(steps=steps)
+                yhat = float(fc.predicted_mean[gdp_col].iloc[-1])
+        except Exception:
+            if verbose and progress_every and (i % progress_every == 0):
+                elapsed = time.perf_counter() - t_iter_start
+                print(f"[DFM] {i}/{total_targets} {t.date()} -> skip (forecast error), {elapsed:.2f}s")
+            continue
+
+        ytrue = float(df.loc[target_ts, gdp_col]) if pd.notna(df.loc[target_ts, gdp_col]) else np.nan
 
         rows.append(
             {
-                "as_of": as_of,
-                "target_quarter": str(target_q),
-                "mixture_forecast": float(mix_out.mixture_forecast),
-                "n_models_used": len(mix_out.mixture_components_used),
-                "n_failed": int(mix_out.n_failed),
-                "n_trimmed": int(mix_out.n_trimmed),
+                "date": target_ts,
+                "y_true": ytrue,
+                "y_pred": float(yhat),
+                "k_best": int(best_k),
+                "crit_best": float(best_val),
+                "criterion": str(criterion),
+                "n_months_train": int(train.shape[0]),
+                "status": best_status,
             }
         )
+        if verbose and progress_every and (i % progress_every == 0):
+            elapsed = time.perf_counter() - t_iter_start
+            total_elapsed = time.perf_counter() - t0_all
+            print(
+                f"[DFM] {i}/{total_targets} {t.date()} -> ok (k={best_k}, train={train.shape[0]}), "
+                f"{elapsed:.2f}s, total {total_elapsed/60:.1f}m"
+            )
 
-    out = pd.DataFrame(rows).sort_values("as_of").reset_index(drop=True)
-    out_path = "dfm_mixture_results.csv"
-    out.to_csv(out_path, index=False)
-    logger.info(f"Saved -> {out_path}")
+    out = pd.DataFrame(rows)
+    if out.empty:
+        # Return empty but well-typed frame
+        return pd.DataFrame(columns=["y_true", "y_pred", "k_best", "crit_best", "criterion", "n_months_train"]).set_index(
+            pd.DatetimeIndex([], name="date")
+        )
 
-    print(out.tail(10).to_string(index=False))
-
-
-if __name__ == "__main__":
-    main()
+    out = out.sort_values("date").set_index("date")
+    # status column is optional diagnostics; drop it if you don’t want it
+    # out = out.drop(columns=["status"])
+    return out
